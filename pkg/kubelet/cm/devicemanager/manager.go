@@ -41,7 +41,6 @@ import (
 	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubelet/checkpointmanager"
 	"k8s.io/kubernetes/pkg/kubelet/checkpointmanager/errors"
-	"k8s.io/kubernetes/pkg/kubelet/cm/containermap"
 	"k8s.io/kubernetes/pkg/kubelet/cm/devicemanager/checkpoint"
 	plugin "k8s.io/kubernetes/pkg/kubelet/cm/devicemanager/plugin/v1beta1"
 	"k8s.io/kubernetes/pkg/kubelet/cm/resourceupdates"
@@ -102,14 +101,13 @@ type ManagerImpl struct {
 	// init containers.
 	devicesToReuse PodReusableDevices
 
-	// containerMap provides a mapping from (pod, container) -> containerID
-	// for all containers in a pod. Used to detect pods running across a restart
-	containerMap containermap.ContainerMap
-
-	// containerRunningSet identifies which container among those present in `containerMap`
-	// was reported running by the container runtime when `containerMap` was computed.
-	// Used to detect pods running across a restart
-	containerRunningSet sets.Set[string]
+	// pluginReportedSet tracks which resource names have received at least one ListAndWatch
+	// response from their device plugin since this kubelet started. Used to distinguish
+	// "plugin has not reconnected yet after kubelet restart" (trust the checkpoint) from
+	// "plugin has reported and healthyDevices is authoritative" (apply health checks).
+	// readCheckpoint initializes healthyDevices to an empty set — indistinguishable from
+	// a live plugin reporting all-unhealthy without this signal.
+	pluginReportedSet sets.Set[string]
 
 	// update channel for device health updates
 	update chan resourceupdates.Update
@@ -155,6 +153,7 @@ func newManagerImpl(logger klog.Logger, socketPath string, topology []cadvisorap
 		healthyDevices:        make(map[string]sets.Set[string]),
 		unhealthyDevices:      make(map[string]sets.Set[string]),
 		allocatedDevices:      make(map[string]sets.Set[string]),
+		pluginReportedSet:     sets.New[string](),
 		podDevices:            newPodDevices(),
 		numaNodes:             numaNodes,
 		topologyAffinityStore: topologyAffinityStore,
@@ -267,6 +266,7 @@ func (m *ManagerImpl) PluginListAndWatchReceiver(logger klog.Logger, resourceNam
 func (m *ManagerImpl) genericDeviceUpdateCallback(logger klog.Logger, resourceName string, devices []*pluginapi.Device) {
 	healthyCount := 0
 	m.mutex.Lock()
+	m.pluginReportedSet.Insert(resourceName)
 	m.healthyDevices[resourceName] = sets.New[string]()
 	m.unhealthyDevices[resourceName] = sets.New[string]()
 	oldDevices := m.allDevices[resourceName]
@@ -337,13 +337,11 @@ func (m *ManagerImpl) checkpointFile() string {
 // Start starts the Device Plugin Manager and start initialization of
 // podDevices and allocatedDevices information from checkpointed state and
 // starts device plugin registration service.
-func (m *ManagerImpl) Start(logger klog.Logger, activePods ActivePodsFunc, sourcesReady config.SourcesReady, initialContainers containermap.ContainerMap, initialContainerRunningSet sets.Set[string]) error {
+func (m *ManagerImpl) Start(logger klog.Logger, activePods ActivePodsFunc, sourcesReady config.SourcesReady) error {
 	logger.V(2).Info("Starting Device Plugin manager")
 
 	m.activePods = activePods
 	m.sourcesReady = sourcesReady
-	m.containerMap = initialContainers
-	m.containerRunningSet = initialContainerRunningSet
 
 	// Loads in allocatedDevices information from disk.
 	err := m.readCheckpoint(logger)
@@ -603,16 +601,22 @@ func (m *ManagerImpl) devicesToAllocate(ctx context.Context, podUID, contName, r
 	// 3. node reboot. In this scenario device plugins may not be running yet when we try to allocate devices.
 	//    note: if we get this far the runtime is surely running. This is usually enforced at OS level by startup system services dependencies.
 
-	// First we take care of the exceptional flow (scenarios 2 and 3). In both flows, kubelet is reinitializing, and while kubelet is initializing, sources are NOT all ready.
-	// Is this a simple kubelet restart (scenario 2)? To distinguish, we use the information we got for runtime. If we are asked to allocate devices for containers reported
-	// running, then it can only be a kubelet restart. On node reboot the runtime and the containers were also shut down. Then, if the container was running, it can only be
-	// because it already has access to all the required devices, so we got nothing to do and we can bail out.
-	if !m.sourcesReady.AllReady() && m.isContainerAlreadyRunning(logger, podUID, contName) {
-		logger.V(3).Info("Container detected running, nothing to do", "deviceNumber", needed, "resourceName", resource, "podUID", podUID, "containerName", contName)
+	// First we take care of the exceptional flow (scenarios 2 and 3). If the device plugin for this resource has not yet sent a ListAndWatch response
+	// since this kubelet started, and the checkpoint has a prior allocation, we trust the checkpoint. This covers both scenario 2 (kubelet-only restart,
+	// container still running with its devices) and scenario 3 with a checkpoint (node reboot — the container will be recreated, and GetDeviceRunContainerOptions
+	// will defer container-start until the plugin reports, preserving the #109595 invariant that containers do not start with stale device mounts).
+	//
+	// Previously this gated on isContainerAlreadyRunning, which depends on the CRI snapshot at containerManager.Start(). That snapshot is fragile:
+	// buildContainerMapAndRunningSetFromRuntime silently discards ListPodSandbox/ListContainers errors (issue #118559), and when a container restarted
+	// shortly before kubelet did the snapshot may hold multiple container IDs for the same (podUID, containerName) — exited and running — making the
+	// running check sensitive to which ID gets examined. Gating on the checkpoint allocation sidesteps both fragilities.
+	if !m.pluginReportedSet.Has(resource) && devices != nil {
+		logger.V(3).Info("Device plugin has not yet reported and checkpoint has allocation; trusting checkpoint", "resourceName", resource, "podUID", podUID, "containerName", contName)
 		return nil, nil
 	}
 
-	// We dealt with scenario 2. If we got this far it's either scenario 3 (node reboot) or scenario 1 (steady state, normal flow).
+	// From here on, healthyDevices for this resource is authoritative: either the plugin has reported (scenario 1 steady state, or scenario 2/3 after
+	// the plugin reconnected), or the checkpoint had no allocation for this pod/container (a genuinely new pod, or a node reboot with no prior state).
 	logger.V(3).Info("Need devices to allocate for pod", "deviceNumber", needed, "resourceName", resource, "podUID", podUID, "containerName", contName)
 	healthyDevices, hasRegistered := m.healthyDevices[resource]
 
@@ -965,6 +969,16 @@ func (m *ManagerImpl) GetDeviceRunContainerOptions(ctx context.Context, pod *v1.
 		if !m.isDevicePluginResource(resource) || v.Value() == 0 {
 			continue
 		}
+		// devicesToAllocate now lets admission pass on the basis of a checkpoint allocation while the plugin has not yet reported.
+		// That is safe for a container that was already running at kubelet start (scenario 2), but for a fresh container start
+		// (scenario 3 — node reboot) we must not hand back stale checkpoint mounts before the plugin confirms the devices exist.
+		// Deferring here keeps the pod in ContainerCreating (retryable) rather than Phase=Failed at admission. Preserves #109595.
+		m.mutex.Lock()
+		pluginReported := m.pluginReportedSet.Has(resource)
+		m.mutex.Unlock()
+		if !pluginReported {
+			return nil, fmt.Errorf("device plugin for resource %s has not yet reported devices; deferring container start", resource)
+		}
 		err := m.callPreStartContainerIfNeeded(ctx, podUID, contName, resource)
 		if err != nil {
 			return nil, err
@@ -1208,37 +1222,3 @@ func (m *ManagerImpl) ShouldResetExtendedResourceCapacity() bool {
 	return len(checkpoints) == 0
 }
 
-func (m *ManagerImpl) isContainerAlreadyRunning(logger klog.Logger, podUID, cntName string) bool {
-	// Check if ANY container for this pod/container name is running.
-	// This handles the case where a container restarted before kubelet restart,
-	// so the containerMap might have multiple entries (old exited + new running).
-	// We need to check all of them to see if any are running.
-	//
-	// Note: if container runtime is down when kubelet restarts, containerRunningSet will be empty,
-	// so containers will fail admission, hitting https://github.com/kubernetes/kubernetes/issues/118559.
-	// This scenario should however be rare enough.
-	foundAnyContainer := false
-	foundRunningContainer := false
-
-	m.containerMap.Visit(func(visitPodUID, visitContainerName, visitContainerID string) {
-		if visitPodUID == podUID && visitContainerName == cntName {
-			foundAnyContainer = true
-			if m.containerRunningSet.Has(visitContainerID) {
-				foundRunningContainer = true
-				logger.V(4).Info("Container found in the initial running set", "podUID", podUID, "containerName", cntName, "containerID", visitContainerID)
-			}
-		}
-	})
-
-	if !foundAnyContainer {
-		logger.V(4).Info("Container not found in the initial map, assumed NOT running", "podUID", podUID, "containerName", cntName)
-		return false
-	}
-
-	if !foundRunningContainer {
-		logger.V(4).Info("Container found in map but not in running set", "podUID", podUID, "containerName", cntName)
-		return false
-	}
-
-	return true
-}

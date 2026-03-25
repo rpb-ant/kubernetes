@@ -47,7 +47,6 @@ import (
 	watcherapi "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
 	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubelet/checkpointmanager"
-	"k8s.io/kubernetes/pkg/kubelet/cm/containermap"
 	"k8s.io/kubernetes/pkg/kubelet/cm/devicemanager/checkpoint"
 	plugin "k8s.io/kubernetes/pkg/kubelet/cm/devicemanager/plugin/v1beta1"
 	"k8s.io/kubernetes/pkg/kubelet/cm/resourceupdates"
@@ -306,9 +305,7 @@ func setupDeviceManager(t *testing.T, devs []*pluginapi.Device, callback monitor
 		return []*v1.Pod{}
 	}
 
-	// test steady state, initialization where sourcesReady, containerMap and containerRunningSet
-	// are relevant will be tested with a different flow
-	err = w.Start(logger, activePods, &sourcesReadyStub{}, containermap.NewContainerMap(), sets.New[string]())
+	err = w.Start(logger, activePods, &sourcesReadyStub{})
 	require.NoError(t, err)
 
 	return w, updateChan
@@ -710,6 +707,7 @@ func TestCheckpoint(t *testing.T) {
 		allocatedDevices:  make(map[string]sets.Set[string]),
 		podDevices:        newPodDevices(),
 		checkpointManager: ckm,
+		pluginReportedSet: sets.New[string](),
 	}
 
 	testManager.podDevices.insert("pod1", "con1", resourceName1,
@@ -870,6 +868,7 @@ func getTestManager(tmpDir string, activePods ActivePodsFunc, testRes []TestReso
 		sourcesReady:          &sourcesReadyStub{},
 		checkpointManager:     ckm,
 		allDevices:            NewResourceDeviceInstances(),
+		pluginReportedSet:     sets.New[string](),
 	}
 	testManager := &wrappedManagerImpl{
 		ManagerImpl: m,
@@ -879,6 +878,7 @@ func getTestManager(tmpDir string, activePods ActivePodsFunc, testRes []TestReso
 
 	for _, res := range testRes {
 		testManager.healthyDevices[res.resourceName] = sets.New[string](res.devs.Devices().UnsortedList()...)
+		testManager.pluginReportedSet.Insert(res.resourceName)
 		if res.resourceName == "domain1.com/resource1" {
 			testManager.endpoints[res.resourceName] = endpointInfo{
 				e:    &MockEndpoint{allocateFunc: allocateStubFunc()},
@@ -1120,13 +1120,14 @@ func TestPodContainerDeviceToAllocate(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	testManager := &ManagerImpl{
-		endpoints:        make(map[string]endpointInfo),
-		healthyDevices:   make(map[string]sets.Set[string]),
-		unhealthyDevices: make(map[string]sets.Set[string]),
-		allocatedDevices: make(map[string]sets.Set[string]),
-		podDevices:       newPodDevices(),
-		activePods:       func() []*v1.Pod { return []*v1.Pod{} },
-		sourcesReady:     &sourcesReadyStub{},
+		endpoints:         make(map[string]endpointInfo),
+		healthyDevices:    make(map[string]sets.Set[string]),
+		unhealthyDevices:  make(map[string]sets.Set[string]),
+		allocatedDevices:  make(map[string]sets.Set[string]),
+		podDevices:        newPodDevices(),
+		activePods:        func() []*v1.Pod { return []*v1.Pod{} },
+		sourcesReady:      &sourcesReadyStub{},
+		pluginReportedSet: sets.New[string](resourceName1, resourceName2, resourceName3),
 	}
 
 	testManager.podDevices.insert("pod1", "con1", resourceName1,
@@ -1217,6 +1218,49 @@ func TestPodContainerDeviceToAllocate(t *testing.T) {
 
 }
 
+// TestDevicesToAllocateTrustsCheckpointBeforePluginReports covers kubelet restart
+// when the checkpoint has a prior allocation for a pod but the device plugin has
+// not yet sent a ListAndWatch response. The bypass must trust the checkpoint
+// regardless of CRI-snapshot state — covering issue #118559 (CRI errors leave
+// the snapshot empty) and the case where a pod was scheduled seconds before
+// restart (checkpoint written, container not yet created in CRI).
+func TestDevicesToAllocateTrustsCheckpointBeforePluginReports(t *testing.T) {
+	tCtx := ktesting.Init(t)
+	resourceName := "domain1.com/resource1"
+	podUID := "pod1"
+	contName := "con1"
+
+	testManager := &ManagerImpl{
+		endpoints:        make(map[string]endpointInfo),
+		healthyDevices:   make(map[string]sets.Set[string]),
+		unhealthyDevices: make(map[string]sets.Set[string]),
+		allocatedDevices: make(map[string]sets.Set[string]),
+		podDevices:       newPodDevices(),
+		activePods:       func() []*v1.Pod { return []*v1.Pod{} },
+		sourcesReady:     &sourcesReadyStub{},
+	}
+
+	// Checkpoint from the prior kubelet has an allocation for this pod/container.
+	testManager.podDevices.insert(podUID, contName, resourceName,
+		constructDevices([]string{"dev1", "dev2"}),
+		newContainerAllocateResponse(
+			withDevices(map[string]string{"/dev/dev1": "/dev/dev1", "/dev/dev2": "/dev/dev2"}),
+		),
+	)
+
+	// readCheckpoint initialized healthyDevices to empty; plugin has not yet sent ListAndWatch.
+	testManager.healthyDevices[resourceName] = sets.New[string]()
+
+	// Checkpoint has the allocation and the plugin has not yet reported — bypass must fire.
+	allocDevices, err := testManager.devicesToAllocate(tCtx, podUID, contName, resourceName, 2, sets.New[string]())
+	if err != nil {
+		t.Fatalf("devicesToAllocate returned error %q; expected nil — a pod with a valid checkpoint allocation must not be rejected before the plugin reports (issue #118559)", err)
+	}
+	if allocDevices != nil {
+		t.Fatalf("devicesToAllocate returned devices %v; expected nil — bypass should have fired, trusting the checkpoint allocation", allocDevices)
+	}
+}
+
 func TestDevicesToAllocateConflictWithUpdateAllocatedDevices(t *testing.T) {
 	tCtx := ktesting.Init(t)
 	podToAllocate := "podToAllocate"
@@ -1256,6 +1300,7 @@ func TestDevicesToAllocateConflictWithUpdateAllocatedDevices(t *testing.T) {
 		activePods:            func() []*v1.Pod { return []*v1.Pod{} },
 		sourcesReady:          &sourcesReadyStub{},
 		topologyAffinityStore: topologymanager.NewFakeManager(),
+		pluginReportedSet:     sets.New[string](resourceName),
 	}
 
 	testManager.endpoints[resourceName] = endpointInfo{
@@ -1593,6 +1638,7 @@ func TestUpdatePluginResources(t *testing.T) {
 		healthyDevices:    make(map[string]sets.Set[string]),
 		podDevices:        newPodDevices(),
 		checkpointManager: ckm,
+		pluginReportedSet: sets.New[string](),
 	}
 	testManager := wrappedManagerImpl{
 		ManagerImpl: m,
@@ -1716,6 +1762,7 @@ func TestResetExtendedResource(t *testing.T) {
 		allocatedDevices:  make(map[string]sets.Set[string]),
 		podDevices:        newPodDevices(),
 		checkpointManager: ckm,
+		pluginReportedSet: sets.New[string](),
 	}
 
 	extendedResourceName := "domain.com/resource"
@@ -1921,6 +1968,7 @@ func TestUpdateAllocatedResourcesStatus(t *testing.T) {
 		allDevices:        make(map[string]DeviceInstances),
 		podDevices:        newPodDevices(),
 		checkpointManager: ckm,
+		pluginReportedSet: sets.New[string](),
 	}
 
 	testManager.podDevices.insert(podUID, containerName, resourceName,
@@ -2028,6 +2076,7 @@ func TestFeatureGateResourceHealthStatus(t *testing.T) {
 		podDevices:        newPodDevices(),
 		checkpointManager: ckm,
 		update:            make(chan resourceupdates.Update, deviceUpdateChanBuffer),
+		pluginReportedSet: sets.New[string](),
 	}
 
 	for i := 0; i < deviceUpdateNumber; i++ {
@@ -2128,8 +2177,9 @@ func TestAdmitPodWithDRAResources(t *testing.T) {
 				allocatedDevices: map[string]sets.Set[string]{
 					resourceName: sets.New("Dev"),
 				},
-				activePods:   func() []*v1.Pod { return nil },
-				sourcesReady: &sourcesReadyStub{},
+				activePods:        func() []*v1.Pod { return nil },
+				sourcesReady:      &sourcesReadyStub{},
+				pluginReportedSet: sets.New[string](),
 			}
 
 			err := testManager.Allocate(pod, &pod.Spec.Containers[0])

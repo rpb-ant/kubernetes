@@ -21,10 +21,8 @@ import (
 	"time"
 
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apiserver/pkg/server/healthz"
 	"k8s.io/klog/v2"
-	"k8s.io/kubernetes/pkg/kubelet/cm/containermap"
 	"k8s.io/kubernetes/pkg/kubelet/cm/resourceupdates"
 	"k8s.io/kubernetes/pkg/kubelet/cm/topologymanager"
 	"k8s.io/kubernetes/pkg/kubelet/config"
@@ -37,7 +35,7 @@ import (
 // Manager manages all the Device Plugins running on a node.
 type Manager interface {
 	// Start starts device plugin registration service.
-	Start(logger klog.Logger, activePods ActivePodsFunc, sourcesReady config.SourcesReady, initialContainers containermap.ContainerMap, initialContainerRunningSet sets.Set[string]) error
+	Start(logger klog.Logger, activePods ActivePodsFunc, sourcesReady config.SourcesReady) error
 
 	// Allocate configures and assigns devices to a container in a pod. From
 	// the requested device resources, Allocate will communicate with the
