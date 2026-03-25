@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/onsi/ginkgo/v2"
@@ -53,6 +54,7 @@ import (
 	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	e2etestfiles "k8s.io/kubernetes/test/e2e/framework/testfiles"
+	"k8s.io/kubernetes/test/e2e_node/criproxy"
 	testutils "k8s.io/kubernetes/test/utils"
 )
 
@@ -1004,6 +1006,111 @@ func testDevicePluginNodeReboot(f *framework.Framework, pluginSockDir string) {
 				_, found := checkPodResourcesAssignment(v1PodResources, pod1.Namespace, pod1.Name, pod1.Spec.Containers[0].Name, e2enode.SampleDeviceResourceName, []string{})
 				return found
 			}, 30*time.Second, framework.Poll).Should(gomega.BeFalseBecause("%s/%s/%s failed admission, so it must not appear in podresources list", pod1.Namespace, pod1.Name, pod1.Spec.Containers[0].Name))
+		})
+
+		// simulate a kubelet restart where the initial CRI snapshot (ListPodSandbox + ListContainers)
+		// returns an error. helpers.go:buildContainerMapAndRunningSetFromRuntime silently discards
+		// these errors, leaving containerRunningSet empty. The scenario-2 bypass in devicesToAllocate
+		// then falls through to the healthyDevices check and rejects the still-running pod with
+		// UnexpectedAdmissionError. See https://github.com/kubernetes/kubernetes/issues/118559.
+		//
+		// This test deliberately fails on master (asserts the pod survives, which it doesn't). It
+		// passes once devicesToAllocate trusts the checkpoint allocation rather than the CRI snapshot
+		// while the device plugin has not yet re-registered.
+		framework.It("Keeps device plugin assignments across kubelet restart when CRI snapshot returns an error (app pod running, device plugin not re-registered)", feature.CriProxy, func(ctx context.Context) {
+			if e2eCriProxy == nil {
+				ginkgo.Skip("test requires CRI proxy (run with --cri-proxy-enabled=true)")
+			}
+			ginkgo.DeferCleanup(func() error { return resetCRIProxyInjector(e2eCriProxy) })
+
+			podRECMD := fmt.Sprintf("devs=$(ls /tmp/ | egrep '^Dev-[0-9]+$') && echo stub devices: $devs && sleep %s", sleepIntervalForever)
+			pod1 := e2epod.NewPodClient(f).CreateSync(ctx, makeBusyboxPod(e2enode.SampleDeviceResourceName, podRECMD))
+			deviceIDRE := "stub devices: (Dev-[0-9]+)"
+			devID1, err := parseLog(ctx, f, pod1.Name, pod1.Name, deviceIDRE)
+			framework.ExpectNoError(err, "getting logs for pod %q", pod1.Name)
+			gomega.Expect(devID1).To(gomega.Not(gomega.Equal("")))
+
+			pod1, err = e2epod.NewPodClient(f).Get(ctx, pod1.Name, metav1.GetOptions{})
+			framework.ExpectNoError(err)
+
+			ginkgo.By("stopping the kubelet")
+			restartKubelet := mustStopKubelet(ctx, f)
+
+			// Remove only the device plugin sandbox so the plugin will not re-register quickly.
+			// The app container stays running in containerd — this is the production scenario.
+			ginkgo.By("removing only the device plugin sandbox via CRI")
+			rs, _, err := getCRIClient(ctx)
+			framework.ExpectNoError(err)
+			sandboxes, err := rs.ListPodSandbox(ctx, &runtimeapi.PodSandboxFilter{})
+			framework.ExpectNoError(err)
+			removed := false
+			for _, sandbox := range sandboxes {
+				gomega.Expect(sandbox.Metadata).ToNot(gomega.BeNil())
+				if sandbox.Metadata.Name != devicePluginPod.Name {
+					continue
+				}
+				ginkgo.By(fmt.Sprintf("deleting device plugin sandbox via CRI: %s/%s -> %s", sandbox.Metadata.Namespace, sandbox.Metadata.Name, sandbox.Id))
+				framework.ExpectNoError(rs.RemovePodSandbox(ctx, sandbox.Id))
+				removed = true
+			}
+			gomega.Expect(removed).To(gomega.BeTrueBecause("expected to find and remove the device plugin sandbox"))
+
+			// Arm the CRI proxy to fail ListPodSandbox and ListContainers during early kubelet
+			// startup. buildContainerMapAndRunningSetFromRuntime calls each once during
+			// containerManager.Start(), but garbage collection and stats initialization also
+			// call these APIs earlier. Fail all calls within a short window after arming
+			// (covers GC + snapshot, typically <300ms into startup) then let PLEG and the
+			// rest of kubelet proceed normally.
+			ginkgo.By("arming CRI proxy to fail ListPodSandbox/ListContainers during the startup snapshot window")
+			var listPodSandboxCalls, listContainersCalls atomic.Int32
+			armedAt := time.Now()
+			const injectionWindow = 2 * time.Second
+			err = addCRIProxyInjector(e2eCriProxy, func(apiName string) error {
+				if time.Since(armedAt) > injectionWindow {
+					return nil
+				}
+				switch apiName {
+				case criproxy.ListPodSandbox:
+					listPodSandboxCalls.Add(1)
+					return fmt.Errorf("injected failure: simulating transient CRI error during containerManager snapshot")
+				case criproxy.ListContainers:
+					listContainersCalls.Add(1)
+					return fmt.Errorf("injected failure: simulating transient CRI error during containerManager snapshot")
+				}
+				return nil
+			})
+			framework.ExpectNoError(err)
+
+			ginkgo.By("restarting the kubelet")
+			restartKubelet(ctx)
+
+			ginkgo.By("waiting for node to be ready again")
+			e2enode.WaitForAllNodesSchedulable(ctx, f.ClientSet, 5*time.Minute)
+
+			framework.Logf("CRI injector fired %d ListPodSandbox and %d ListContainers failures during the %v injection window", listPodSandboxCalls.Load(), listContainersCalls.Load(), injectionWindow)
+
+			// Sanity check: the injector actually fired during the startup window.
+			gomega.Expect(listPodSandboxCalls.Load()).To(gomega.BeNumerically(">=", int32(1)), "CRI proxy ListPodSandbox injector never fired")
+			gomega.Expect(listContainersCalls.Load()).To(gomega.BeNumerically(">=", int32(1)), "CRI proxy ListContainers injector never fired")
+
+			// The app container was running throughout. The checkpoint has its allocation.
+			// An incomplete CRI snapshot must not cause re-admission to reject it.
+			ginkgo.By("verifying the pod is still running with its original device assignment")
+			gomega.Consistently(ctx, getPodByName).
+				WithArguments(f, pod1.Name).
+				WithTimeout(30*time.Second).WithPolling(2*time.Second).
+				Should(BeTheSamePodStillRunning(pod1),
+					"pod was evicted after kubelet restart despite being a running container with a valid checkpoint allocation — CRI snapshot failure must not cause re-admission to reject running pods (issue #118559)")
+
+			ginkgo.By("verifying the device assignment is preserved via the podresources API")
+			gomega.Eventually(ctx, func(ctx context.Context) error {
+				v1PodResources, err := getV1NodeDevices(ctx)
+				if err != nil {
+					return fmt.Errorf("failed to get node devices: %w", err)
+				}
+				matchErr, _ := checkPodResourcesAssignment(v1PodResources, pod1.Namespace, pod1.Name, pod1.Spec.Containers[0].Name, e2enode.SampleDeviceResourceName, []string{devID1})
+				return matchErr
+			}, time.Minute, framework.Poll).Should(gomega.Succeed())
 		})
 	})
 }
