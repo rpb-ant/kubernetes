@@ -1542,6 +1542,80 @@ func TestCacherSendsMultipleWatchBookmarks(t *testing.T) {
 	}
 }
 
+func TestCacherForwardsProgressBookmarkWhenQuiet(t *testing.T) {
+	backingStorage := &cachertesting.MockStorage{}
+	cacher, _, err := newTestCacher(backingStorage)
+	if err != nil {
+		t.Fatalf("Couldn't create cacher: %v", err)
+	}
+	defer cacher.Stop()
+	// Note: bookmarkFrequency stays at the default (1 minute), so any
+	// bookmark observed within seconds must come from the progress
+	// forwarding path, not the periodic heartbeat.
+
+	pred := storage.Everything
+	pred.AllowWatchBookmarks = true
+
+	// Initialize the watch cache.
+	if err := cacher.watchCache.Add(&examplev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "pod-0",
+			Namespace:       "ns",
+			ResourceVersion: "100",
+		},
+	}); err != nil {
+		t.Fatalf("failed to add a pod: %v", err)
+	}
+
+	// A long watch deadline keeps the pre-deadline heartbeat bookmark
+	// (sent ~2s before expiry) far beyond this test's window, so any
+	// bookmark observed below must come from progress forwarding.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	w, err := cacher.Watch(ctx, "/pods/ns", storage.ListOptions{ResourceVersion: "100", Predicate: pred})
+	if err != nil {
+		t.Fatalf("Failed to create watch: %v", err)
+	}
+	defer w.Stop()
+
+	// Let the resource go quiet (no events for > progressBookmarkInterval),
+	// then deliver storage-layer progress notifications. Retrying with
+	// increasing resource versions makes the test robust on slow machines:
+	// each attempt re-tests the quiet-window and rate-floor guards, so at
+	// least one lands in an open window well before the 1-minute heartbeat.
+	time.Sleep(progressBookmarkInterval + 200*time.Millisecond)
+	nextRV := uint64(2000)
+	cacher.watchCache.UpdateResourceVersion(strconv.FormatUint(nextRV, 10))
+
+	deadline := time.After(15 * time.Second)
+	retry := time.NewTicker(progressBookmarkInterval + 200*time.Millisecond)
+	defer retry.Stop()
+	for {
+		select {
+		case event, ok := <-w.ResultChan():
+			if !ok {
+				t.Fatal("Unexpected closed channel")
+			}
+			if event.Type != watch.Bookmark {
+				continue
+			}
+			rv, err := cacher.versioner.ObjectResourceVersion(event.Object)
+			if err != nil {
+				t.Fatalf("failed to parse resource version from %#v: %v", event.Object, err)
+			}
+			if rv < 2000 {
+				t.Errorf("expected progress bookmark at rv>=2000, got %d", rv)
+			}
+			return
+		case <-retry.C:
+			nextRV++
+			cacher.watchCache.UpdateResourceVersion(strconv.FormatUint(nextRV, 10))
+		case <-deadline:
+			t.Fatal("timed out waiting for progress bookmark; it would only arrive after bookmarkFrequency (1m) without progress forwarding")
+		}
+	}
+}
+
 func TestDispatchingBookmarkEventsWithConcurrentStop(t *testing.T) {
 	backingStorage := &cachertesting.MockStorage{}
 	cacher, _, err := newTestCacher(backingStorage)

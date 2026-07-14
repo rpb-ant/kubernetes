@@ -386,6 +386,45 @@ func TestTimeBucketWatchersBasic(t *testing.T) {
 	}
 }
 
+func TestTimeBucketWatchersAll(t *testing.T) {
+	filter := func(_ string, _ labels.Set, _ fields.Set, _ runtime.Object) bool {
+		return true
+	}
+	forget := func(bool) {}
+
+	newWatcher := func(deadline time.Time) *cacheWatcher {
+		w := newCacheWatcher(0, filter, forget, storage.APIObjectVersioner{}, deadline, true, schema.GroupResource{Resource: "pods"}, "")
+		w.setBookmarkAfterResourceVersion(0)
+		return w
+	}
+
+	clock := testingclock.NewFakeClock(time.Now())
+	watchers := newTimeBucketWatchers(clock, defaultBookmarkFrequency)
+	now := clock.Now()
+	watchers.addWatcherThreadUnsafe(newWatcher(now.Add(10 * time.Second)))
+	watchers.addWatcherThreadUnsafe(newWatcher(now.Add(20 * time.Second)))
+	watchers.addWatcherThreadUnsafe(newWatcher(now.Add(20 * time.Second)))
+
+	// allWatchers returns every scheduled watcher, due or not...
+	all := watchers.allWatchersThreadUnsafe()
+	total := 0
+	for _, ws := range all {
+		total += len(ws)
+	}
+	if total != 3 {
+		t.Errorf("expected 3 watchers, got %d: %#v", total, all)
+	}
+	// ...while leaving the buckets untouched, so the heartbeat schedule
+	// is preserved.
+	if len(watchers.watchersBuckets) != 2 {
+		t.Errorf("expected buckets to be untouched, got: %#v", watchers.watchersBuckets)
+	}
+	clock.Step(10 * time.Second)
+	if popped := watchers.popExpiredWatchersThreadUnsafe(); len(popped) != 1 || len(popped[0]) != 1 {
+		t.Errorf("unexpected bucket size: %#v", popped)
+	}
+}
+
 func makeWatchCacheEvent(rv uint64) *watchCacheEvent {
 	return &watchCacheEvent{
 		Type: watch.Added,

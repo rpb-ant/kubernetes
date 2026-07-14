@@ -67,6 +67,11 @@ type watchCacheEvent struct {
 	Key             string
 	ResourceVersion uint64
 	RecordTime      time.Time
+	// isProgressNotify marks a bookmark that forwards storage-layer
+	// progress (an etcd progress notification) rather than the periodic
+	// per-watcher heartbeat; these are delivered to all
+	// bookmark-requesting watchers at once — see Cacher.dispatchEvents.
+	isProgressNotify bool
 }
 
 // watchCache implements a Store interface.

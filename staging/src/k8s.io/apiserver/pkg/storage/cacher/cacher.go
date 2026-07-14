@@ -76,6 +76,15 @@ const (
 	// defaultBookmarkFrequency defines how frequently watch bookmarks should be send
 	// in addition to sending a bookmark right before watch deadline.
 	defaultBookmarkFrequency = time.Minute
+
+	// progressBookmarkInterval bounds how often storage-layer progress
+	// bookmarks are forwarded to watchers: a resource must have dispatched
+	// no regular event for at least this long (i.e. the resource is quiet,
+	// so progress notifications are the only freshness signal its watchers
+	// will see), and at most one progress bookmark is forwarded per
+	// interval (progress notifications can arrive at 100ms granularity
+	// while a consistent read is waiting for the cache to catch up).
+	progressBookmarkInterval = time.Second
 )
 
 // Config contains the configuration for a given Cache.
@@ -247,6 +256,22 @@ func (t *watcherBookmarkTimeBuckets) popExpiredWatchersThreadUnsafe() [][]*cache
 		}
 	}
 	return expiredWatchers
+}
+
+// allWatchersThreadUnsafe returns every scheduled watcher regardless of
+// its bucket deadline, leaving the buckets untouched — used to forward
+// storage progress to all bookmark-requesting watchers. Not popping is
+// deliberate: it preserves each watcher's heartbeat schedule (popping and
+// rescheduling would collapse the naturally staggered buckets into one,
+// turning the per-minute heartbeat into a synchronized spike) and keeps
+// the pre-deadline bookmark slot intact even when a progress delivery is
+// dropped by a full watcher channel.
+func (t *watcherBookmarkTimeBuckets) allWatchersThreadUnsafe() [][]*cacheWatcher {
+	allWatchers := make([][]*cacheWatcher, 0, len(t.watchersBuckets))
+	for _, watchers := range t.watchersBuckets {
+		allWatchers = append(allWatchers, watchers)
+	}
+	return allWatchers
 }
 
 type filterWithAttrsFunc func(key string, l labels.Set, f fields.Set, obj runtime.Object) bool
@@ -894,36 +919,43 @@ func (c *Cacher) dispatchEvents() {
 		// the non-empty error means that the stopCh was closed
 		return
 	}
+	lastRegularEventTime := c.clock.Now()
+	var lastProgressBookmarkTime time.Time
 	for {
 		select {
 		case event, ok := <-c.incoming:
 			if !ok {
 				return
 			}
-			// Don't dispatch bookmarks coming from the storage layer.
-			// They can be very frequent (even to the level of subseconds)
-			// to allow efficient watch resumption on kube-apiserver restarts,
-			// and propagating them down may overload the whole system.
-			//
-			// TODO: If at some point we decide the performance and scalability
-			// footprint is acceptable, this is the place to hook them in.
-			// However, we then need to check if this was called as a result
-			// of a bookmark event or regular Add/Update/Delete operation by
-			// checking if resourceVersion here has changed.
 			if event.Type != watch.Bookmark {
 				c.dispatchEvent(&event)
+				lastRegularEventTime = c.clock.Now()
+			} else if event.ResourceVersion > lastProcessedResourceVersion &&
+				c.clock.Since(lastRegularEventTime) >= progressBookmarkInterval &&
+				c.clock.Since(lastProgressBookmarkTime) >= progressBookmarkInterval {
+				// A storage-layer bookmark (etcd progress notification) on a
+				// quiet resource: with no events flowing, the per-watcher
+				// bookmarkFrequency heartbeat would keep repeating a frozen
+				// resource version for up to a minute while the fresh one
+				// sits here. Forward the progress to all bookmark-requesting
+				// watchers now. Quietness is tracked per resource, not per
+				// watcher: selector-filtered watchers on a busy resource
+				// still ride the heartbeat. Note the interval bounds forward
+				// rounds, not fan-out — each round is O(watchers) deliveries.
+				lastProgressBookmarkTime = c.clock.Now()
+				if bookmarkEvent, err := c.bookmarkEvent(event.ResourceVersion, true); err == nil {
+					c.dispatchEvent(bookmarkEvent)
+				} else {
+					klog.Errorf("failure to set resourceVersion to %d on progress bookmark event", event.ResourceVersion)
+				}
 			}
 			lastProcessedResourceVersion = event.ResourceVersion
 			metrics.EventsCounter.WithLabelValues(c.groupResource.Group, c.groupResource.Resource).Inc()
 		case <-bookmarkTimer.C():
 			bookmarkTimer.Reset(wait.Jitter(time.Second, 0.25))
-			bookmarkEvent := &watchCacheEvent{
-				Type:            watch.Bookmark,
-				Object:          c.newFunc(),
-				ResourceVersion: lastProcessedResourceVersion,
-			}
-			if err := c.versioner.UpdateObject(bookmarkEvent.Object, bookmarkEvent.ResourceVersion); err != nil {
-				klog.Errorf("failure to set resourceVersion to %d on bookmark event %+v", bookmarkEvent.ResourceVersion, bookmarkEvent.Object)
+			bookmarkEvent, err := c.bookmarkEvent(lastProcessedResourceVersion, false)
+			if err != nil {
+				klog.Errorf("failure to set resourceVersion to %d on bookmark event %+v", lastProcessedResourceVersion, bookmarkEvent)
 				continue
 			}
 			c.dispatchEvent(bookmarkEvent)
@@ -931,6 +963,20 @@ func (c *Cacher) dispatchEvents() {
 			return
 		}
 	}
+}
+
+// bookmarkEvent returns a dispatchable bookmark event at the given
+// resourceVersion. Progress bookmarks (isProgressNotify) are delivered to
+// all bookmark-requesting watchers; regular ones only to watchers whose
+// bookmarkFrequency bucket has expired.
+func (c *Cacher) bookmarkEvent(resourceVersion uint64, isProgressNotify bool) (*watchCacheEvent, error) {
+	event := &watchCacheEvent{
+		Type:             watch.Bookmark,
+		Object:           c.newFunc(),
+		ResourceVersion:  resourceVersion,
+		isProgressNotify: isProgressNotify,
+	}
+	return event, c.versioner.UpdateObject(event.Object, resourceVersion)
 }
 
 func setCachingObjects(event *watchCacheEvent, versioner storage.Versioner) {
@@ -1033,9 +1079,27 @@ func (c *Cacher) dispatchEvent(event *watchCacheEvent) {
 	}
 }
 
-func (c *Cacher) startDispatchingBookmarkEventsLocked() {
-	// Pop already expired watchers. However, explicitly ignore stopped ones,
-	// as we don't delete watcher from bookmarkWatchers when it is stopped.
+func (c *Cacher) startDispatchingBookmarkEventsLocked(includeNotYetDue bool) {
+	// In both branches, explicitly ignore stopped watchers, as we don't
+	// delete a watcher from bookmarkWatchers when it is stopped.
+	if includeNotYetDue {
+		// Progress bookmark: deliver to every bookmark-requesting watcher
+		// without popping, so heartbeat schedules stay untouched (watchers
+		// are not appended to expiredBookmarkWatchers and thus are not
+		// rescheduled by finishDispatching).
+		for _, watchers := range c.bookmarkWatchers.allWatchersThreadUnsafe() {
+			for _, watcher := range watchers {
+				// c.Lock() is held here.
+				// watcher.stopThreadUnsafe() is protected by c.Lock()
+				if watcher.stopped {
+					continue
+				}
+				c.watchersBuffer = append(c.watchersBuffer, watcher)
+			}
+		}
+		return
+	}
+	// Periodic heartbeat: pop already expired watchers.
 	for _, watchers := range c.bookmarkWatchers.popExpiredWatchersThreadUnsafe() {
 		for _, watcher := range watchers {
 			// c.Lock() is held here.
@@ -1069,7 +1133,7 @@ func (c *Cacher) startDispatching(event *watchCacheEvent) {
 	c.watchersBuffer = c.watchersBuffer[:0]
 
 	if event.Type == watch.Bookmark {
-		c.startDispatchingBookmarkEventsLocked()
+		c.startDispatchingBookmarkEventsLocked(event.isProgressNotify)
 		// return here to reduce following code indentation and diff
 		return
 	}
