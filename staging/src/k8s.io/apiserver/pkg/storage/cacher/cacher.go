@@ -946,7 +946,7 @@ func (c *Cacher) dispatchEvents() {
 				if bookmarkEvent, err := c.bookmarkEvent(event.ResourceVersion, true); err == nil {
 					c.dispatchEvent(bookmarkEvent)
 				} else {
-					klog.Errorf("failure to set resourceVersion to %d on progress bookmark event", event.ResourceVersion)
+					klog.Errorf("failure to set resourceVersion to %d on progress bookmark event %+v", event.ResourceVersion, bookmarkEvent.Object)
 				}
 			}
 			lastProcessedResourceVersion = event.ResourceVersion
@@ -955,7 +955,7 @@ func (c *Cacher) dispatchEvents() {
 			bookmarkTimer.Reset(wait.Jitter(time.Second, 0.25))
 			bookmarkEvent, err := c.bookmarkEvent(lastProcessedResourceVersion, false)
 			if err != nil {
-				klog.Errorf("failure to set resourceVersion to %d on bookmark event %+v", lastProcessedResourceVersion, bookmarkEvent)
+				klog.Errorf("failure to set resourceVersion to %d on bookmark event %+v", bookmarkEvent.ResourceVersion, bookmarkEvent.Object)
 				continue
 			}
 			c.dispatchEvent(bookmarkEvent)
@@ -1079,27 +1079,9 @@ func (c *Cacher) dispatchEvent(event *watchCacheEvent) {
 	}
 }
 
-func (c *Cacher) startDispatchingBookmarkEventsLocked(includeNotYetDue bool) {
-	// In both branches, explicitly ignore stopped watchers, as we don't
-	// delete a watcher from bookmarkWatchers when it is stopped.
-	if includeNotYetDue {
-		// Progress bookmark: deliver to every bookmark-requesting watcher
-		// without popping, so heartbeat schedules stay untouched (watchers
-		// are not appended to expiredBookmarkWatchers and thus are not
-		// rescheduled by finishDispatching).
-		for _, watchers := range c.bookmarkWatchers.allWatchersThreadUnsafe() {
-			for _, watcher := range watchers {
-				// c.Lock() is held here.
-				// watcher.stopThreadUnsafe() is protected by c.Lock()
-				if watcher.stopped {
-					continue
-				}
-				c.watchersBuffer = append(c.watchersBuffer, watcher)
-			}
-		}
-		return
-	}
-	// Periodic heartbeat: pop already expired watchers.
+func (c *Cacher) startDispatchingBookmarkEventsLocked() {
+	// Pop already expired watchers. However, explicitly ignore stopped ones,
+	// as we don't delete watcher from bookmarkWatchers when it is stopped.
 	for _, watchers := range c.bookmarkWatchers.popExpiredWatchersThreadUnsafe() {
 		for _, watcher := range watchers {
 			// c.Lock() is held here.
@@ -1109,6 +1091,25 @@ func (c *Cacher) startDispatchingBookmarkEventsLocked(includeNotYetDue bool) {
 			}
 			c.watchersBuffer = append(c.watchersBuffer, watcher)
 			c.expiredBookmarkWatchers = append(c.expiredBookmarkWatchers, watcher)
+		}
+	}
+}
+
+// startDispatchingProgressBookmarkLocked selects every bookmark-requesting
+// watcher for a storage progress bookmark, without popping the time
+// buckets: heartbeat schedules stay untouched (watchers are not appended
+// to expiredBookmarkWatchers and thus are not rescheduled by
+// finishDispatching). Stopped watchers are ignored, as we don't delete a
+// watcher from bookmarkWatchers when it is stopped.
+func (c *Cacher) startDispatchingProgressBookmarkLocked() {
+	for _, watchers := range c.bookmarkWatchers.allWatchersThreadUnsafe() {
+		for _, watcher := range watchers {
+			// c.Lock() is held here.
+			// watcher.stopThreadUnsafe() is protected by c.Lock()
+			if watcher.stopped {
+				continue
+			}
+			c.watchersBuffer = append(c.watchersBuffer, watcher)
 		}
 	}
 }
@@ -1133,7 +1134,11 @@ func (c *Cacher) startDispatching(event *watchCacheEvent) {
 	c.watchersBuffer = c.watchersBuffer[:0]
 
 	if event.Type == watch.Bookmark {
-		c.startDispatchingBookmarkEventsLocked(event.isProgressNotify)
+		if event.isProgressNotify {
+			c.startDispatchingProgressBookmarkLocked()
+		} else {
+			c.startDispatchingBookmarkEventsLocked()
+		}
 		// return here to reduce following code indentation and diff
 		return
 	}
