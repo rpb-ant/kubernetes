@@ -134,13 +134,6 @@ func (wm watchersMap) deleteWatcher(number int) {
 	delete(wm, number)
 }
 
-func (wm watchersMap) terminateAll(done func(*cacheWatcher)) {
-	for key, watcher := range wm {
-		delete(wm, key)
-		done(watcher)
-	}
-}
-
 type indexedWatchers struct {
 	allWatchers   map[namespacedName]watchersMap
 	valueWatchers map[string]watchersMap
@@ -173,6 +166,13 @@ func (i *indexedWatchers) deleteWatcher(number int, scope namespacedName, value 
 		if len(i.allWatchers[scope]) == 0 {
 			delete(i.allWatchers, scope)
 		}
+	}
+}
+
+func (wm watchersMap) terminateAll(done func(*cacheWatcher)) {
+	for key, watcher := range wm {
+		delete(wm, key)
+		done(watcher)
 	}
 }
 
@@ -343,6 +343,24 @@ type Cacher struct {
 	expiredBookmarkWatchers []*cacheWatcher
 	compactor               *compactor
 	watcherMetrics          *metrics.WatcherMetricsObservers
+
+	// stall is non-nil exactly when the WatchCacheStallResume feature gate
+	// is enabled (read once at construction): watchers whose input channel
+	// fills up are poked and catch up from the watch cache history instead
+	// of being terminated. When nil, dispatch behaves exactly as before the
+	// gate existed.
+	stall *cacherStall
+}
+
+// cacherStall is the per-Cacher stall-and-resume state; a Cacher holds one
+// exactly when the WatchCacheStallResume gate is on, making the nil check
+// the single mode representation.
+type cacherStall struct {
+	// metrics holds the pre-resolved metric children shared by all
+	// watchers of this Cacher.
+	metrics *metrics.StallResumeObservers
+	// cache serves catch-up intervals from its event history (eventsSince).
+	cache *watchCache
 }
 
 // NewCacherFromConfig creates a new Cacher responsible for servicing WATCH and LIST requests from
@@ -455,6 +473,12 @@ func NewCacherFromConfig(config Config) (*Cacher, error) {
 
 	cacher.watchCache = watchCache
 	cacher.reflector = reflector
+	if utilfeature.DefaultFeatureGate.Enabled(features.WatchCacheStallResume) {
+		cacher.stall = &cacherStall{
+			metrics: metrics.NewStallResumeObservers(config.GroupResource),
+			cache:   watchCache,
+		}
+	}
 
 	if utilfeature.DefaultFeatureGate.Enabled(features.SizeBasedListCostEstimate) {
 		err := config.Storage.EnableResourceSizeEstimation(cacher.getKeys)
@@ -569,6 +593,8 @@ func (c *Cacher) Watch(ctx context.Context, key string, opts storage.ListOptions
 	// - having it large enough to ensure that watchers that need to process
 	//   a bunch of changes have enough buffer to avoid from blocking other
 	//   watchers on our watcher having a processing hiccup
+	// (with WatchCacheStallResume the size no longer decides whether a slow
+	// watcher survives; see suggestedWatchChannelSize)
 	chanSize := c.watchCache.suggestedWatchChannelSize(c.indexedTrigger != nil, triggerSupported)
 
 	// client-go is going to fall back to a standard LIST on any error
@@ -610,6 +636,11 @@ func (c *Cacher) Watch(ctx context.Context, key string, opts storage.ListOptions
 		c.clock,
 		identifier,
 	)
+	if c.stall != nil {
+		// Must happen before the watcher is registered, so the dispatcher never
+		// sees a stall-mode watcher without its latch.
+		watcher.enableStallResume(c.stall)
+	}
 
 	// note that c.waitUntilWatchCacheFreshAndForceAllEvents must be called without
 	// the c.watchCache.RLock held otherwise we are at risk of a deadlock
@@ -1022,6 +1053,18 @@ func (c *Cacher) dispatchEvent(event *watchCacheEvent) {
 		wcEvent := *event
 		setCachingObjects(&wcEvent, c.versioner)
 		event = &wcEvent
+
+		if c.stall != nil {
+			// Stall/resume mode: never wait for a slow watcher and never
+			// terminate it here. A watcher whose input channel is full is
+			// poked and later catches up from the watch cache history.
+			for _, watcher := range c.watchersBuffer {
+				if !watcher.nonblockingAdd(event) {
+					watcher.poke(event.ResourceVersion)
+				}
+			}
+			return
+		}
 
 		c.blockedWatchers = c.blockedWatchers[:0]
 		for _, watcher := range c.watchersBuffer {

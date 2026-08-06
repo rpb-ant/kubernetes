@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/utils/clock"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -89,6 +90,26 @@ type cacheWatcher struct {
 
 	// state holds a numeric value indicating the current state of the watcher
 	state int
+
+	// stall is non-nil exactly when the WatchCacheStallResume feature gate
+	// is enabled (see enableStallResume); when nil the watcher behaves
+	// exactly as before the gate existed.
+	stall *watcherStall
+}
+
+// watcherStall is the per-watcher stall-and-resume state; a watcher holds
+// one exactly when the WatchCacheStallResume gate is on, making the nil
+// check the single mode representation.
+type watcherStall struct {
+	*cacherStall
+
+	// missed is a capacity-1 latch carrying the resourceVersion of the
+	// first object event of a stall episode that did not fit into the input
+	// channel; later misses of the episode find it full and coalesce onto
+	// it (see resume). The dispatcher fills it, the processing goroutine
+	// takes it. It is never closed: the dispatcher may poke a watcher that
+	// is concurrently stopping.
+	missed chan uint64
 }
 
 func newCacheWatcher(
@@ -120,6 +141,34 @@ func newCacheWatcher(
 		watcherMetrics:      watcherMetrics,
 		clock:               clk,
 		identifier:          identifier,
+	}
+}
+
+// enableStallResume switches the watcher to stall-and-resume mode: instead of
+// being terminated when its input channel fills up, it is poked and catches
+// up from the watch cache history. It must be called before the watcher is
+// registered for dispatch.
+func (c *cacheWatcher) enableStallResume(s *cacherStall) {
+	c.stall = &watcherStall{cacherStall: s, missed: make(chan uint64, 1)}
+}
+
+// poke records that the object event with the given resourceVersion did not
+// fit into this watcher's input channel and must instead be served by a
+// catch-up round from the watch cache history. It latches the
+// resourceVersion if no miss is already pending; otherwise the pending
+// (lower) one stands.
+//
+// It must run synchronously on the dispatching goroutine, in program order
+// after the failed nonblockingAdd, and the latch must stay a capacity-1
+// channel: the ordering argument in processStallResume depends on both.
+func (c *cacheWatcher) poke(resourceVersion uint64) {
+	c.stall.metrics.DeferredEvents.Inc()
+	select {
+	case c.stall.missed <- resourceVersion:
+		// The latch was empty: this failure starts a new stall episode.
+		c.stall.metrics.Stalls.Inc()
+	default:
+		// A miss is already pending; this one coalesces onto it.
 	}
 }
 
@@ -452,8 +501,10 @@ func (c *cacheWatcher) sendWatchCacheEvent(event *watchCacheEvent) (builtAt, sen
 // interval yielded (including events the watcher's filter drops). It returns
 // the number of events the interval yielded. A non-nil error means the
 // interval has been invalidated (the watch cache history moved past it) and
-// can no longer serve events; the returned count is then meaningless.
-func (c *cacheWatcher) streamInterval(cacheInterval *watchCacheInterval, resourceVersion *uint64) (int, error) {
+// can no longer serve events. Delivery latency is observed only when
+// observeLatency is set: the initial interval replays state, whereas a
+// catch-up round delivers live events late.
+func (c *cacheWatcher) streamInterval(cacheInterval *watchCacheInterval, resourceVersion *uint64, observeLatency bool) (int, error) {
 	eventCount := 0
 	for {
 		event, err := cacheInterval.Next()
@@ -463,7 +514,10 @@ func (c *cacheWatcher) streamInterval(cacheInterval *watchCacheInterval, resourc
 		if event == nil {
 			return eventCount, nil
 		}
-		c.sendWatchCacheEvent(event)
+		builtAt, sentAt := c.sendWatchCacheEvent(event)
+		if observeLatency {
+			c.observeDispatchMetrics(event, builtAt, sentAt)
+		}
 
 		// With some events already sent, update resourceVersion so that
 		// events that were buffered and not yet processed won't be delivered
@@ -509,12 +563,18 @@ func (c *cacheWatcher) processInterval(ctx context.Context, cacheInterval *watch
 		resourceVersion = cacheInterval.resourceVersion
 	}
 
-	initEventCount, err := c.streamInterval(cacheInterval, &resourceVersion)
+	initEventCount, err := c.streamInterval(cacheInterval, &resourceVersion, false)
 	if err != nil {
 		// An error indicates that the cache interval
 		// has been invalidated and can no longer serve
 		// events.
-		//
+		if c.stall != nil {
+			// The watch cache history moved past the interval while the
+			// client was still consuming it, i.e. the client fell more than
+			// the history window behind: tell it honestly to re-list.
+			c.terminate(err, resourceVersion, false)
+			return
+		}
 		// Initially we considered sending an "out-of-history"
 		// Error event in this case, but because historically
 		// such events weren't sent out of the watchCache, we
@@ -553,6 +613,11 @@ func (c *cacheWatcher) process(ctx context.Context, resourceVersion uint64) {
 	//   process, but we're leaving this to the tuning phase.
 	utilflowcontrol.WatchInitialized(ctx)
 
+	if c.stall != nil {
+		c.processStallResume(ctx, resourceVersion)
+		return
+	}
+
 	for {
 		select {
 		case event, ok := <-c.input:
@@ -581,4 +646,192 @@ func (c *cacheWatcher) observeDispatchMetrics(event *watchCacheEvent, builtAt, s
 	}
 	c.watcherMetrics.ObserveStage(metrics.StageCacheToWatcher, sentAt.Sub(builtAt))
 	c.watcherMetrics.ObserveStage(metrics.StageTotal, sentAt.Sub(event.RecordTime))
+}
+
+// processStallResume is the stall/resume replacement for process's live
+// loop. It maintains position, the resourceVersion through which this
+// client's view is complete: every event the watcher should see at or below
+// position has been sent (or was covered by the initial interval). Live
+// delivery is filtered against position so an event that arrives both from
+// a catch-up round and from input is sent once, and a latched miss makes the
+// watcher catch up from the watch cache history before it delivers anything
+// dispatched after the miss.
+//
+// Ordering facts relied on (established outside this file):
+//   - watchCache.processEvent appends an event to the history before handing
+//     it to the dispatcher, so a catch-up interval taken after an event was
+//     dispatched covers it;
+//   - a single dispatch goroutine feeds input (events and bookmarks) in
+//     nondecreasing resourceVersion order and runs poke in program order
+//     right after a failed nonblockingAdd, so the miss is latched before any
+//     later event or bookmark can enter input.
+func (c *cacheWatcher) processStallResume(ctx context.Context, position uint64) {
+	// reachedLive tells whether this watcher was ever caught up with the live
+	// stream (delivered from input with no miss pending, or completed a
+	// catch-up round); it only selects the termination reason label if the
+	// watcher later ages out of the history.
+	reachedLive := false
+
+	for {
+		select {
+		case event, ok := <-c.input:
+			if !ok {
+				return
+			}
+			// Check for a miss BEFORE delivering anything received from
+			// input: receiving an event that was enqueued after a poke is
+			// what makes that poke visible here, so this check is what
+			// keeps an event dispatched after the miss from overtaking the
+			// missed one. Do not move poke off the dispatch goroutine and do
+			// not replace the latch with a flag that can read clear while a
+			// miss is outstanding.
+			select {
+			case missed := <-c.stall.missed:
+				if !c.resume(missed, event, &position, reachedLive) {
+					return
+				}
+			default:
+				c.deliverLive(event, &position)
+			}
+			reachedLive = true
+		case missed := <-c.stall.missed:
+			// Load-bearing, not belt-and-braces: if the dispatcher is
+			// descheduled between the failed add and the poke, this
+			// goroutine can drain input to empty (each receive finding
+			// the latch still clear) and park; the token then lands with
+			// no input event left to trigger the nested check above. For
+			// a quiet scope-filtered watcher with no bookmarks the next
+			// input event may be arbitrarily far away, so without this
+			// arm a latched miss would go unserved indefinitely.
+			if !c.resume(missed, nil, &position, reachedLive) {
+				return
+			}
+			reachedLive = true
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// deliverLive applies the live-stream delivery rule to an event received
+// from input. Object events in input carry strictly increasing
+// resourceVersions, so one at or below position was already served by a
+// catch-up round and is dropped; one above it is sent and becomes the
+// position. A bookmark at or beyond position is delivered; one below it was
+// leapt over by a round and would move the client backwards.
+func (c *cacheWatcher) deliverLive(event *watchCacheEvent, position *uint64) {
+	switch {
+	case event.Type == watch.Bookmark:
+		if event.ResourceVersion < *position {
+			return
+		}
+	case event.ResourceVersion > *position:
+		*position = event.ResourceVersion
+	default:
+		return
+	}
+	builtAt, sentAt := c.sendWatchCacheEvent(event)
+	c.observeDispatchMetrics(event, builtAt, sentAt)
+}
+
+// resume handles a latched miss of resourceVersion missed, with event (if
+// non-nil) being an input event already in hand. It returns false if the
+// watcher must exit. reachedLive is passed through to catchUp unchanged:
+// flushing pre-miss input below does not make a watcher caught up.
+//
+// Everything dispatch enqueued for this watcher before the miss is below
+// missed and is already in input (it was enqueued before the miss was
+// latched, which was before the caller took it), so it is first flushed to
+// the client in order; the drain stops at an empty channel or at the first
+// event at or above missed, which was dispatched after the miss. That event
+// is discarded, not held: if it is an object event it is already in the
+// history below the head the round will read, so the round re-serves it in
+// order (a bookmark is simply skipped, as bookmarks are best effort). The
+// client's view is then complete through missed-1 regardless of how stale
+// position was — a scope-filtered watcher may not have seen an event of its
+// own for most of the history window — so the round starts there, and ends
+// in a 410 only if the missed event itself has left the history.
+func (c *cacheWatcher) resume(missed uint64, event *watchCacheEvent, position *uint64, reachedLive bool) bool {
+drain:
+	for {
+		if event != nil {
+			if event.ResourceVersion >= missed {
+				break
+			}
+			c.deliverLive(event, position)
+		}
+		select {
+		case next, ok := <-c.input:
+			if !ok {
+				return false
+			}
+			event = next
+		default:
+			break drain
+		}
+	}
+	*position = max(*position, missed-1)
+	return c.catchUp(position, reachedLive)
+}
+
+// catchUp streams the watch cache history after *position into the result
+// channel, advancing *position past everything the interval yields, then
+// returns to the live stream. It returns false if the watcher must exit
+// because its position has aged out of the history: a 410 was sent to the
+// client, with reachedLive selecting the termination reason. (A watcher
+// stopped mid-round finishes the walk without sending and exits at its next
+// receive from the closed input.)
+//
+// The miss was taken by the caller before this call reads the history, so
+// every miss that coalesced onto it is covered by the returned interval; a
+// miss latched after the take starts the next round.
+func (c *cacheWatcher) catchUp(position *uint64, reachedLive bool) bool {
+	interval, err := c.stall.cache.eventsSince(*position)
+	if err != nil {
+		c.terminate(err, *position, reachedLive)
+		return false
+	}
+	processed, err := c.streamInterval(interval, position, true)
+	if err != nil {
+		// The history moved past our interval while we were streaming it:
+		// the client is too slow to ever catch up.
+		c.terminate(err, *position, reachedLive)
+		return false
+	}
+	c.stall.metrics.CatchupRounds.Inc()
+	c.stall.metrics.CatchupEvents.Observe(float64(processed))
+	klog.V(4).InfoS("Watcher caught up from the watch cache history", "groupResource", c.groupResource, "identifier", c.identifier, "position", *position, "events", processed)
+	return true
+}
+
+// terminate ends this watch because its resume position is no longer covered
+// by the watch cache history: the client gets one in-stream 410 (Expired)
+// ERROR event, exactly like a compaction on a direct etcd watch, and the
+// deferred close of the result channel in processInterval ends the stream.
+func (c *cacheWatcher) terminate(err error, position uint64, reachedLive bool) {
+	select {
+	case <-c.done:
+		// The watcher was already stopped by its client (Stop, deadline,
+		// shutdown): its expiry is not a termination for cause and nobody is
+		// reading the ERROR event; do not count or log it.
+		return
+	default:
+	}
+	reason := metrics.TerminationReasonResourceExpiredInitial
+	counter := c.stall.metrics.TerminatedExpiredInitial
+	if reachedLive {
+		reason = metrics.TerminationReasonResourceExpired
+		counter = c.stall.metrics.TerminatedExpired
+	}
+	counter.Inc()
+	klog.V(2).InfoS("Terminating watcher: resume position no longer in the watch cache history",
+		"groupResource", c.groupResource, "identifier", c.identifier, "position", position, "reason", reason, "err", err)
+
+	// The 410 is the stream's final event: the caller returns into
+	// processInterval's deferred close of the result channel.
+	status := apierrors.NewResourceExpired(fmt.Sprintf("too old resource version: %d", position)).Status()
+	select {
+	case c.result <- watch.Event{Type: watch.Error, Object: &status}:
+	case <-c.done:
+	}
 }

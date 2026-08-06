@@ -188,6 +188,10 @@ const (
 	maxWatchChanSizeWithoutIndex = 100
 )
 
+// suggestedWatchChannelSize returns the size of a watcher's input and result
+// channels. With WatchCacheStallResume the size only trades memory for the
+// frequency of catch-up rounds; it no longer decides whether a slow watcher
+// survives.
 func (w *watchCacheHistory) suggestedWatchChannelSize(indexExists, triggerUsed bool) int {
 	// To estimate the channel size we use a heuristic that a channel
 	// should roughly be able to keep one second of history.

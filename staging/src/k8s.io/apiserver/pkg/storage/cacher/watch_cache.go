@@ -279,6 +279,8 @@ func (w *watchCache) processEvent(event watch.Event, resourceVersion uint64) err
 	// This is safe as long as there is at most one call to Add/Update/Delete and
 	// UpdateResourceVersion in flight at any point in time, which is true now,
 	// because reflector calls them synchronously from its main thread.
+	// The event is already in the history (updateCache above) when the handler
+	// dispatches it; WatchCacheStallResume catch-up rounds rely on this order.
 	if w.config.eventHandler != nil {
 		w.config.eventHandler(wcEvent)
 	}
@@ -667,6 +669,17 @@ func (w *watchCache) getAllEventsSinceLocked(resourceVersion uint64, key string,
 		resourceVersion = w.resourceVersion
 	}
 
+	return w.history.GetIntervalLocked(resourceVersion, w.storage.ListResourceVersion(), w.RWMutex.RLocker())
+}
+
+// eventsSince returns an interval over the history events newer than the
+// given resourceVersion, or a ResourceExpired error if that position is no
+// longer covered by the history. Unlike getAllEventsSinceLocked it never
+// falls back to the store: it serves WatchCacheStallResume catch-up rounds,
+// where an aged-out position must end the watch rather than replay state.
+func (w *watchCache) eventsSince(resourceVersion uint64) (*watchCacheInterval, error) {
+	w.RLock()
+	defer w.RUnlock()
 	return w.history.GetIntervalLocked(resourceVersion, w.storage.ListResourceVersion(), w.RWMutex.RLocker())
 }
 

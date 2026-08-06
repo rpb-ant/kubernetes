@@ -287,6 +287,15 @@ const (
 	// Enables post-start-hook for storage readiness
 	WatchCacheInitializationPostStartHook featuregate.Feature = "WatchCacheInitializationPostStartHook"
 
+	// owner: @sig-api-machinery
+	//
+	// Watchers whose buffer fills up catch up from the watch cache event
+	// history and rejoin the live stream, instead of being terminated. A
+	// watcher is terminated for cause only when an event it missed has aged
+	// out of the history, which is reported to the client as an in-stream 410
+	// error.
+	WatchCacheStallResume featuregate.Feature = "WatchCacheStallResume"
+
 	// owner: @p0lyn0mial
 	//
 	// Allow the API server to stream individual items instead of chunking
@@ -482,6 +491,10 @@ var defaultVersionedKubernetesFeatureGates = map[featuregate.Feature]featuregate
 		{Version: version.MustParse("1.31"), Default: false, PreRelease: featuregate.Beta},
 		{Version: version.MustParse("1.36"), Default: true, PreRelease: featuregate.Beta},
 		{Version: version.MustParse("1.37"), Default: true, PreRelease: featuregate.GA, LockToDefault: true},
+	},
+
+	WatchCacheStallResume: {
+		{Version: version.MustParse("1.37"), Default: false, PreRelease: featuregate.Alpha},
 	},
 
 	WatchList: {
