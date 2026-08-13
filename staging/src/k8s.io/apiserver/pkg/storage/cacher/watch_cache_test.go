@@ -478,7 +478,7 @@ func TestWaitUntilFreshAndGetList(t *testing.T) {
 	if resp.ResourceVersion != 5 {
 		t.Errorf("unexpected resourceVersion: %v, expected: 5", resp.ResourceVersion)
 	}
-	if len(resp.Items) != 3 {
+	if len(itemsFromListResp(resp)) != 3 {
 		t.Errorf("unexpected list returned: %#v", resp)
 	}
 	if indexUsed != "" {
@@ -501,7 +501,7 @@ func TestWaitUntilFreshAndGetList(t *testing.T) {
 	if resp.ResourceVersion != 5 {
 		t.Errorf("unexpected resourceVersion: %v, expected: 5", resp.ResourceVersion)
 	}
-	if len(resp.Items) != 2 {
+	if len(itemsFromListResp(resp)) != 2 {
 		t.Errorf("unexpected list returned: %#v", resp)
 	}
 	if indexUsed != "l:label" {
@@ -524,7 +524,7 @@ func TestWaitUntilFreshAndGetList(t *testing.T) {
 	if resp.ResourceVersion != 5 {
 		t.Errorf("unexpected resourceVersion: %v, expected: 5", resp.ResourceVersion)
 	}
-	if len(resp.Items) != 1 {
+	if len(itemsFromListResp(resp)) != 1 {
 		t.Errorf("unexpected list returned: %#v", resp)
 	}
 	if indexUsed != "f:spec.nodeName" {
@@ -545,7 +545,7 @@ func TestWaitUntilFreshAndGetList(t *testing.T) {
 	if resp.ResourceVersion != 5 {
 		t.Errorf("unexpected resourceVersion: %v, expected: 5", resp.ResourceVersion)
 	}
-	if len(resp.Items) != 3 {
+	if len(itemsFromListResp(resp)) != 3 {
 		t.Errorf("unexpected list returned: %#v", resp)
 	}
 	if indexUsed != "" {
@@ -572,7 +572,7 @@ func TestWaitUntilFreshAndListFromCache(t *testing.T) {
 	if resp.ResourceVersion != 3 {
 		t.Errorf("unexpected resourceVersion: %v, expected: 6", resp.ResourceVersion)
 	}
-	if len(resp.Items) != 1 {
+	if len(itemsFromListResp(resp)) != 1 {
 		t.Errorf("unexpected list returned: %#v", resp)
 	}
 	if indexUsed != "" {
@@ -1395,7 +1395,7 @@ func testWatchCacheSnapshotConcurrency(t *testing.T, s *testWatchCache, resource
 			t.Errorf("Expected list ResourceVersion %d, got %d", targetRV, resp.ResourceVersion)
 		}
 		if expectItemRVLessOrEqualListRV {
-			maxItemRV := getMaxItemRV(t, s.config.versioner, resp.Items)
+			maxItemRV := getMaxItemRV(t, s.config.versioner, itemsFromListResp(resp))
 			if maxItemRV > resp.ResourceVersion {
 				t.Errorf("Violated consistency: max item resource version %d is greater than list resource version %d", maxItemRV, resp.ResourceVersion)
 			}
@@ -1404,6 +1404,14 @@ func testWatchCacheSnapshotConcurrency(t *testing.T, s *testWatchCache, resource
 
 	close(stopUpdates)
 	wg.Wait()
+}
+
+func itemsFromListResp(resp listResp) []interface{} {
+	var items []interface{}
+	for elem := range resp.All() {
+		items = append(items, elem)
+	}
+	return items
 }
 
 func getMaxItemRV(t *testing.T, versioner storage.Versioner, items []interface{}) uint64 {

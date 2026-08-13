@@ -161,6 +161,14 @@ func compareKey(elem *Element, key string) int {
 	return strings.Compare(elem.Key, key)
 }
 
+func SingleElementRange(elem *Element) Range {
+	return orderedElements{elem}
+}
+
+func EmptyRange() Range {
+	return orderedElements(nil)
+}
+
 // listSnapshot serves an unordered index bucket.
 type listSnapshot []*Element
 
