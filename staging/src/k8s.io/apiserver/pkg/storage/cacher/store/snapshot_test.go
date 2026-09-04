@@ -31,11 +31,16 @@ func TestSnapshotListPrefix(t *testing.T) {
 		testStorageElement("/pods/ns1/a", "a", 1),
 		testStorageElement("/pods/ns1/c", "c", 3),
 	}
-	// orderedListSnapshot is excluded: it serves a pre-computed range and
-	// ignores prefix and continueKey by contract. Prefixes are "/"-terminated
-	// as the cacher produces them; the implementations differ on other
-	// prefixes (strings.HasPrefix in the btree, path segments in
-	// listSnapshot).
+	// Prefixes are "/"-terminated as the cacher produces them; the
+	// implementations differ on other prefixes (strings.HasPrefix in the
+	// btree, path segments in listSnapshot).
+	populatedIndexer := func(t *testing.T) Indexer {
+		indexer := newThreadedBtreeStoreIndexer(nil, btreeDegree)
+		for _, elem := range elements {
+			require.NoError(t, indexer.Add(elem))
+		}
+		return indexer
+	}
 	snapshots := []struct {
 		name        string
 		newSnapshot func(t *testing.T) Snapshot
@@ -43,11 +48,7 @@ func TestSnapshotListPrefix(t *testing.T) {
 		{
 			name: "Indexer",
 			newSnapshot: func(t *testing.T) Snapshot {
-				indexer := newThreadedBtreeStoreIndexer(nil, btreeDegree)
-				for _, elem := range elements {
-					require.NoError(t, indexer.Add(elem))
-				}
-				return indexer.Clone()
+				return populatedIndexer(t).Clone()
 			},
 		},
 		{
@@ -63,11 +64,15 @@ func TestSnapshotListPrefix(t *testing.T) {
 		{
 			name: "listSnapshot",
 			newSnapshot: func(t *testing.T) Snapshot {
-				items := make([]interface{}, 0, len(elements))
-				for _, elem := range elements {
-					items = append(items, elem)
-				}
-				return listSnapshot{Items: items}
+				return listSnapshot(elements)
+			},
+		},
+		{
+			name: "orderedElements",
+			newSnapshot: func(t *testing.T) Snapshot {
+				snapshot, err := orderedSnapshotResponseFromIndexer(populatedIndexer(t), "/pods/", "")
+				require.NoError(t, err)
+				return snapshot
 			},
 		},
 	}
@@ -102,14 +107,13 @@ func TestSnapshotListPrefix(t *testing.T) {
 					}
 					assert.Equal(t, tc.expectKeys, listed, "OrderedListPrefix")
 
+					r := snapshot.RangePrefix(tc.prefix, tc.continueKey)
 					var ranged []string
-					for elem, err := range snapshot.RangePrefix(tc.prefix, tc.continueKey) {
-						require.NoError(t, err)
+					for elem := range r.All() {
 						ranged = append(ranged, elem.Key)
 					}
 					assert.Equal(t, tc.expectKeys, ranged, "RangePrefix")
-
-					assert.Equal(t, len(tc.expectKeys), snapshot.Count(tc.prefix, tc.continueKey), "Count")
+					assert.Equal(t, len(tc.expectKeys), r.Count(), "Count")
 				})
 			}
 		})
