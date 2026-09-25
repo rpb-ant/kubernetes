@@ -128,14 +128,14 @@ type orderedListSnapshot struct {
 
 var _ Snapshot = (*orderedListSnapshot)(nil)
 
-func (o orderedListSnapshot) GetByKey(key string) (interface{}, bool, error) {
+func (o orderedListSnapshot) GetByKey(key string) (*Element, bool) {
 	for _, item := range o.Items {
 		elem, ok := item.(*Element)
 		if ok && elem.Key == key {
-			return item, true, nil
+			return elem, true
 		}
 	}
-	return nil, false, nil
+	return nil, false
 }
 
 func (o orderedListSnapshot) OrderedListPrefix(prefix, continueKey string) ([]interface{}, error) {
@@ -172,14 +172,14 @@ type listSnapshot struct {
 
 var _ Snapshot = (*listSnapshot)(nil)
 
-func (l listSnapshot) GetByKey(key string) (interface{}, bool, error) {
+func (l listSnapshot) GetByKey(key string) (*Element, bool) {
 	for _, item := range l.Items {
 		elem, ok := item.(*Element)
 		if ok && elem.Key == key {
-			return item, true, nil
+			return elem, true
 		}
 	}
-	return nil, false, nil
+	return nil, false
 }
 
 func (l listSnapshot) OrderedListPrefix(prefix string, continueKey string) ([]interface{}, error) {

@@ -80,7 +80,7 @@ func (si *WatchCacheStorage) get(obj interface{}) (item interface{}, exists bool
 	return si.store.Get(obj)
 }
 
-func (si *WatchCacheStorage) GetByKey(key string) (item interface{}, exists bool, err error) {
+func (si *WatchCacheStorage) GetByKey(key string) (*Element, bool) {
 	si.lock.RLock()
 	defer si.lock.RUnlock()
 	return si.store.GetByKey(key)
@@ -151,7 +151,7 @@ func (s *btreeStore) Get(obj interface{}) (item interface{}, exists bool, err er
 	return item, exists, nil
 }
 
-func (s *btreeStore) GetByKey(key string) (item interface{}, exists bool, err error) {
+func (s *btreeStore) GetByKey(key string) (*Element, bool) {
 	return s.getByKey(key)
 }
 
@@ -174,10 +174,9 @@ func (s *btreeStore) addOrUpdateElem(storeElem *Element) *Element {
 	return oldObj
 }
 
-func (s *btreeStore) getByKey(key string) (item interface{}, exists bool, err error) {
+func (s *btreeStore) getByKey(key string) (*Element, bool) {
 	keyElement := &Element{Key: key}
-	item, exists = s.tree.Get(keyElement)
-	return item, exists, nil
+	return s.tree.Get(keyElement)
 }
 
 func (s *btreeStore) OrderedListPrefix(prefix, continueKey string) ([]interface{}, error) {

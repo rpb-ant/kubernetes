@@ -533,8 +533,8 @@ type countingSnapshot struct {
 	orderedListPrefixCalls int
 }
 
-func (s *countingSnapshot) GetByKey(string) (interface{}, bool, error) {
-	return nil, false, nil
+func (s *countingSnapshot) GetByKey(string) (*store.Element, bool) {
+	return nil, false
 }
 
 func (s *countingSnapshot) OrderedListPrefix(_, _ string) ([]interface{}, error) {

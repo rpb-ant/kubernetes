@@ -149,8 +149,8 @@ type fakeSnapshot struct {
 	rv int
 }
 
-func (f fakeSnapshot) GetByKey(key string) (item interface{}, exists bool, err error) {
-	return nil, false, nil
+func (f fakeSnapshot) GetByKey(key string) (*Element, bool) {
+	return nil, false
 }
 
 func (f fakeSnapshot) OrderedListPrefix(prefixKey, continueKey string) ([]interface{}, error) {

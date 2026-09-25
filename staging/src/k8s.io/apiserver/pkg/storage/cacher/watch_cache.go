@@ -390,16 +390,12 @@ func (c *watchCache) waitUntilFreshAndGetList(ctx context.Context, key string, o
 			return listResp{}, "", err
 		}
 	}
-	obj, exists, readResourceVersion, err := c.WaitUntilFreshAndGet(ctx, listRV, key)
+	elem, exists, readResourceVersion, err := c.WaitUntilFreshAndGet(ctx, listRV, key)
 	if err != nil {
 		return listResp{}, "", err
 	}
 	if !exists {
 		return listResp{ResourceVersion: readResourceVersion, Range: store.EmptyRange()}, "", nil
-	}
-	elem, ok := obj.(*store.Element)
-	if !ok {
-		return listResp{}, "", fmt.Errorf("non *store.Element returned from storage: %v", obj)
 	}
 	return listResp{ResourceVersion: readResourceVersion, Range: store.SingleElementRange(elem)}, "", nil
 }
@@ -544,7 +540,7 @@ func (w *watchCache) notFresh(resourceVersion uint64) bool {
 }
 
 // WaitUntilFreshAndGet returns a pointers to <storeElement> object.
-func (w *watchCache) WaitUntilFreshAndGet(ctx context.Context, resourceVersion uint64, key string) (interface{}, bool, uint64, error) {
+func (w *watchCache) WaitUntilFreshAndGet(ctx context.Context, resourceVersion uint64, key string) (*store.Element, bool, uint64, error) {
 	span := tracing.SpanFromContext(ctx)
 	consistentReadSupported := delegator.ConsistentReadSupported()
 	w.RLock()
@@ -555,13 +551,9 @@ func (w *watchCache) WaitUntilFreshAndGet(ctx context.Context, resourceVersion u
 		return nil, false, 0, err
 	}
 	span.AddEvent("watchCache fresh enough")
-	value, exists, err := w.storage.GetByKey(key)
-	if err != nil {
-		span.AddEvent("GetByKey failed", attribute.String("error", err.Error()))
-		return nil, false, 0, err
-	}
+	elem, exists := w.storage.GetByKey(key)
 	span.AddEvent("GetByKey success")
-	return value, exists, w.resourceVersion, err
+	return elem, exists, w.resourceVersion, nil
 }
 
 // Replace takes slice of runtime.Object as a parameter.

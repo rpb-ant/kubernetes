@@ -708,7 +708,7 @@ func (c *Cacher) Get(ctx context.Context, key string, opts storage.GetOptions, o
 		return err
 	}
 
-	obj, exists, readResourceVersion, err := c.watchCache.WaitUntilFreshAndGet(ctx, getRV, key)
+	elem, exists, readResourceVersion, err := c.watchCache.WaitUntilFreshAndGet(ctx, getRV, key)
 	if err != nil {
 		return err
 	}
@@ -716,10 +716,6 @@ func (c *Cacher) Get(ctx context.Context, key string, opts storage.GetOptions, o
 	defer span.End(500 * time.Millisecond)
 
 	if exists {
-		elem, ok := obj.(*store.Element)
-		if !ok {
-			return fmt.Errorf("non *store.Element returned from storage: %v", obj)
-		}
 		objVal.Set(reflect.ValueOf(elem.Object).Elem())
 	} else {
 		objVal.Set(reflect.Zero(objVal.Type()))

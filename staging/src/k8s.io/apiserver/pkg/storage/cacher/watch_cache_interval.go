@@ -69,7 +69,7 @@ func newCacheInterval(startIndex, endIndex int, indexer indexerFunc, indexValida
 }
 
 type intervalStore interface {
-	GetByKey(key string) (item interface{}, exists bool, err error)
+	GetByKey(key string) (*store.Element, bool)
 	OrderedListPrefix(prefix, continueKey string) ([]interface{}, error)
 }
 
@@ -82,12 +82,8 @@ func newCacheIntervalFromStore(resourceVersion uint64, s intervalStore, key stri
 	var allItems []interface{}
 	var err error
 	if matchesSingle {
-		item, exists, err := s.GetByKey(key)
-		if err != nil {
-			return nil, err
-		}
-		if exists {
-			allItems = append(allItems, item)
+		if elem, exists := s.GetByKey(key); exists {
+			allItems = append(allItems, elem)
 		}
 	} else {
 		allItems, err = s.OrderedListPrefix("", "")
