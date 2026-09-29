@@ -37,11 +37,12 @@ import (
 //     Complexity: O(log n).
 //     Executed for each watch event observed by the cache.
 //   - `GetLessOrEqual`: Retrieves the snapshot with the greatest RV less than or equal to the requested RV.
+//     Refuses RVs below the highest RV passed to `RemoveLess`.
 //     Complexity: O(log n).
 //     Executed for each LIST request with match=Exact or continuation.
-//   - `RemoveLess`: Cleans up snapshots outside the watch history window.
+//   - `RemoveLess`: Forgets every RV below the given one, and no RV at or above it.
 //     Complexity: O(k log n), k - number of snapshots to remove, usually only one if watch capacity was not reduced.
-//     Executed per watch event observed when the cache is full.
+//     Executed per watch event observed when the cache is full, and when storage is compacted.
 //   - `Reset`: Cleans up all snapshots.
 //     Complexity: O(1).
 //     Executed when the watch cache is reinitialized.
@@ -63,6 +64,8 @@ func newSnapshotter() snapshotter {
 
 type snapshotter struct {
 	snapshots *btree.BTree[rvSnapshot]
+	// GetLessOrEqual answers no RV below removedLess.
+	removedLess uint64
 }
 
 type rvSnapshot struct {
@@ -75,6 +78,9 @@ func (s *snapshotter) Reset() {
 }
 
 func (s *snapshotter) GetLessOrEqual(rv uint64) (Snapshot, bool) {
+	if rv < s.removedLess {
+		return nil, false
+	}
 	var result *rvSnapshot
 	s.snapshots.DescendLessOrEqual(rvSnapshot{resourceVersion: rv}, func(rvs rvSnapshot) bool {
 		result = &rvs
@@ -91,12 +97,19 @@ func (s *snapshotter) Add(rv uint64, snapshot Snapshot) {
 }
 
 func (s *snapshotter) RemoveLess(rv uint64) {
+	s.removedLess = max(s.removedLess, rv)
+	// The newest snapshot at or below rv is the state at rv, so it stays.
+	keep := rv
+	s.snapshots.DescendLessOrEqual(rvSnapshot{resourceVersion: rv}, func(floor rvSnapshot) bool {
+		keep = floor.resourceVersion
+		return false
+	})
 	for s.snapshots.Len() > 0 {
 		oldest, ok := s.snapshots.Min()
 		if !ok {
 			break
 		}
-		if rv <= oldest.resourceVersion {
+		if keep <= oldest.resourceVersion {
 			break
 		}
 		s.snapshots.DeleteMin()

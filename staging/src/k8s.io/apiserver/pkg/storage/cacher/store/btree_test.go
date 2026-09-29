@@ -147,6 +147,59 @@ func TestStoreSnapshotter(t *testing.T) {
 	assert.False(t, found)
 }
 
+func TestStoreSnapshotterRemoveLess(t *testing.T) {
+	cache := newSnapshotter()
+	// want is the RV of the expected snapshot, 0 when none is expected.
+	expect := func(rv uint64, want int) {
+		t.Helper()
+		snapshot, found := cache.GetLessOrEqual(rv)
+		if want == 0 {
+			assert.False(t, found, "rv %d", rv)
+			return
+		}
+		if assert.True(t, found, "rv %d", rv) {
+			assert.Equal(t, want, snapshot.(fakeSnapshot).rv, "rv %d", rv)
+		}
+	}
+	cache.Add(10, fakeSnapshot{rv: 10})
+	cache.Add(20, fakeSnapshot{rv: 20})
+	cache.Add(30, fakeSnapshot{rv: 30})
+	cache.Add(40, fakeSnapshot{rv: 40})
+
+	t.Log("Remove between snapshots keeps the state at the removed RV")
+	cache.RemoveLess(25)
+	assert.Equal(t, 3, cache.Len())
+	expect(20, 0)
+	expect(24, 0)
+	expect(25, 20)
+	expect(29, 20)
+	expect(30, 30)
+
+	t.Log("Remove with lower RV brings nothing back")
+	cache.RemoveLess(15)
+	assert.Equal(t, 3, cache.Len())
+	expect(24, 0)
+	expect(25, 20)
+
+	t.Log("Remove at the RV of a snapshot keeps nothing older")
+	cache.RemoveLess(30)
+	assert.Equal(t, 2, cache.Len())
+	expect(29, 0)
+	expect(30, 30)
+
+	t.Log("Remove above the newest snapshot keeps only it")
+	cache.RemoveLess(50)
+	assert.Equal(t, 1, cache.Len())
+	expect(49, 0)
+	expect(50, 40)
+	expect(100, 40)
+
+	t.Log("Snapshot added below the removed RV is the state at the removed RV")
+	cache.Add(45, fakeSnapshot{rv: 45})
+	expect(45, 0)
+	expect(50, 45)
+}
+
 type fakeSnapshot struct {
 	rv int
 }

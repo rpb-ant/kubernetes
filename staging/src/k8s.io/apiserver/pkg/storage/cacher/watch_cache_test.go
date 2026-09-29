@@ -1406,6 +1406,80 @@ func testWatchCacheSnapshotConcurrency(t *testing.T, s *testWatchCache, resource
 	wg.Wait()
 }
 
+func TestListExactAfterCompaction(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ListFromCacheSnapshot, true)
+	forceRequestWatchProgressSupport(t)
+
+	listExact := func(t *testing.T, wc *testWatchCache, rv uint64) ([]string, error) {
+		t.Helper()
+		resp, _, err := wc.WaitUntilFreshAndGetList(context.Background(), "/prefix/", storage.ListOptions{
+			ResourceVersion:      strconv.FormatUint(rv, 10),
+			ResourceVersionMatch: metav1.ResourceVersionMatchExact,
+			Predicate:            storage.Everything,
+			Recursive:            true,
+		})
+		if err != nil {
+			return nil, err
+		}
+		names := []string{}
+		for _, item := range itemsFromListResp(t, resp) {
+			names = append(names, item.(*store.Element).Object.(*v1.Pod).Name)
+		}
+		return names, nil
+	}
+	expectItems := func(t *testing.T, wc *testWatchCache, rv uint64, want ...string) {
+		t.Helper()
+		got, err := listExact(t, wc, rv)
+		require.NoError(t, err, "rv %d", rv)
+		require.Equal(t, want, got, "rv %d", rv)
+	}
+	expectExpired := func(t *testing.T, wc *testWatchCache, rv uint64) {
+		t.Helper()
+		_, err := listExact(t, wc, rv)
+		require.True(t, errors.IsResourceExpired(err), "rv %d: %v", rv, err)
+	}
+
+	t.Run("RV reached only by a later bookmark", func(t *testing.T) {
+		wc := newTestWatchCache(3, DefaultEventFreshDuration, &cache.Indexers{})
+		defer wc.Stop()
+		require.NoError(t, wc.Replace([]interface{}{makeTestPod("foo", 50)}, "100"))
+		wc.UpdateResourceVersion("300")
+		wc.storage.Compact(200)
+
+		wc.bookmarkRevision <- 400
+		expectItems(t, wc, 400, "foo")
+	})
+
+	t.Run("Compaction ahead of the cache", func(t *testing.T) {
+		wc := newTestWatchCache(3, DefaultEventFreshDuration, &cache.Indexers{})
+		defer wc.Stop()
+		require.NoError(t, wc.Replace([]interface{}{makeTestPod("foo", 50)}, "100"))
+		wc.storage.Compact(200)
+
+		require.NoError(t, wc.Add(makeTestPod("bar", 150)))
+		expectExpired(t, wc, 150)
+		wc.UpdateResourceVersion("200")
+		expectItems(t, wc, 200, "bar", "foo")
+	})
+
+	t.Run("Full event buffer trims the kept snapshot", func(t *testing.T) {
+		wc := newTestWatchCache(3, DefaultEventFreshDuration, &cache.Indexers{})
+		defer wc.Stop()
+		wc.history.upperBoundCapacity = 3
+		require.NoError(t, wc.Replace([]interface{}{makeTestPod("foo", 50)}, "100"))
+		wc.UpdateResourceVersion("300")
+		wc.storage.Compact(200)
+
+		require.NoError(t, wc.Add(makeTestPod("bar", 400)))
+		require.NoError(t, wc.Add(makeTestPod("baz", 500)))
+		expectItems(t, wc, 300, "foo")
+
+		require.NoError(t, wc.Add(makeTestPod("qux", 600)))
+		expectExpired(t, wc, 300)
+		expectItems(t, wc, 400, "bar", "foo")
+	})
+}
+
 func itemsFromListResp(t *testing.T, resp listResp) []interface{} {
 	t.Helper()
 	var items []interface{}

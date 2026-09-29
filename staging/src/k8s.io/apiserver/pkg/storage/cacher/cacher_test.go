@@ -30,6 +30,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/apitesting"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
@@ -350,6 +351,102 @@ func TestMarkConsistent(t *testing.T) {
 	})
 	if len(etcdRequests) != 0 {
 		t.Errorf("Expected no requests to etcd, got: %+v", etcdRequests)
+	}
+}
+
+func TestListFromCacheAfterCompactionPassedLastWrite(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ListFromCacheSnapshot, true)
+	// Size estimation can be enabled once per storage, which both caches share.
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.SizeBasedListCostEstimate, false)
+	ctx, observedWrites, server, terminate := testSetupWithEtcdServer(t)
+	t.Cleanup(terminate)
+	recorder := server.V3Client.Kubernetes.(*storagetesting.KubernetesRecorder)
+	increaseRV := increaseRVFunc(server.V3Client.Client)
+
+	for _, name := range []string{"a", "b", "c"} {
+		pod := &example.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: name}}
+		if err := observedWrites.Create(ctx, computePodKey(pod), pod, &example.Pod{}, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The second cache starts after the writes, so it holds them as a list and not as events.
+	listedWritesCacher, err := NewCacherFromConfig(Config{
+		Storage:             observedWrites.storage,
+		Versioner:           storage.APIObjectVersioner{},
+		GroupResource:       schema.GroupResource{Resource: "pods"},
+		EventsHistoryWindow: DefaultEventFreshDuration,
+		ResourcePrefix:      "/pods/",
+		KeyFunc:             func(obj runtime.Object) (string, error) { return storage.NamespaceKeyFunc("/pods/", obj) },
+		GetAttrsFunc:        GetPodAttrs,
+		NewFunc:             newPod,
+		NewListFunc:         newPodList,
+		Indexers:            &cache.Indexers{},
+		Codec:               examplev1ProtoCodec,
+		Clock:               clock.RealClock{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(listedWritesCacher.Stop)
+	if err := listedWritesCacher.Wait(ctx); err != nil {
+		t.Fatal(err)
+	}
+	listedWrites := NewCacheDelegator(listedWritesCacher, observedWrites.storage)
+	t.Cleanup(listedWrites.Stop)
+	caches := []*CacheDelegator{observedWrites, listedWrites}
+
+	compactRV := increaseRV(ctx, t)
+	compactStore(observedWrites, server.V3Client.Client)(ctx, t, fmt.Sprintf("%d", compactRV))
+	listedWritesCacher.compactor.compactIfNeeded()
+
+	recorderKey := rand.String(10)
+	list := func(c *CacheDelegator, opts storage.ListOptions) (*example.PodList, error) {
+		opts.Recursive = true
+		out := &example.PodList{}
+		return out, c.GetList(context.WithValue(ctx, storagetesting.RecorderContextKey, recorderKey), "/pods/ns", opts, out)
+	}
+	exact := func(rv int64) storage.ListOptions {
+		return storage.ListOptions{ResourceVersion: fmt.Sprintf("%d", rv), ResourceVersionMatch: metav1.ResourceVersionMatchExact, Predicate: storage.Everything}
+	}
+
+	t.Log("Each page is served by the other cache, after etcd moved on")
+	names := []string{}
+	token := ""
+	for i := 0; i == 0 || token != ""; i++ {
+		increaseRV(ctx, t)
+		out, err := list(caches[i%2], storage.ListOptions{
+			Predicate: storage.SelectionPredicate{Label: labels.Everything(), Field: fields.Everything(), Limit: 1, Continue: token},
+		})
+		if err != nil {
+			t.Fatalf("Unexpected error on page %d: %v", i, err)
+		}
+		names = append(names, out.Items[0].Name)
+		token = out.Continue
+	}
+	if want := []string{"a", "b", "c"}; !apiequality.Semantic.DeepEqual(names, want) {
+		t.Errorf("Unexpected items, got: %v, want: %v", names, want)
+	}
+
+	t.Log("Compact revision is served")
+	for i, c := range caches {
+		out, err := list(c, exact(compactRV))
+		if err != nil {
+			t.Fatalf("Unexpected error from cache %d: %v", i, err)
+		}
+		if len(out.Items) != 3 {
+			t.Errorf("Unexpected items from cache %d: %v", i, out.Items)
+		}
+	}
+	if etcdRequests := recorder.ListRequestForKey(recorderKey); len(etcdRequests) != 0 {
+		t.Errorf("Expected no requests to etcd, got %d: %+v", len(etcdRequests), etcdRequests)
+	}
+
+	t.Log("Compacted revision is expired")
+	for i, c := range caches {
+		if _, err := list(c, exact(compactRV-1)); !apierrors.IsResourceExpired(err) {
+			t.Errorf("Expected resource expired error from cache %d, got: %v", i, err)
+		}
 	}
 }
 
