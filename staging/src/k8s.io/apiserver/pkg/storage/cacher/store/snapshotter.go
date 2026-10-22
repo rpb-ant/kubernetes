@@ -174,6 +174,7 @@ func (s *snapshotter) RemoveLess(rv uint64) {
 	if !s.enabled {
 		return
 	}
+	var newestRemoved *btreeStore
 	for s.snapshots.Len() > 0 {
 		oldest, ok := s.snapshots.Min()
 		if !ok {
@@ -182,7 +183,11 @@ func (s *snapshotter) RemoveLess(rv uint64) {
 		if rv <= oldest.resourceVersion {
 			break
 		}
-		s.snapshots.DeleteMin()
+		newestRemoved, _ = s.snapshots.DeleteMin()
+	}
+	// A snapshot is the state until the next snapshot, so the newest one removed is the state at rv, once the cache has observed rv.
+	if newestRemoved != nil && !s.HasSnapshot(rv) && rv <= s.resourceVersion {
+		s.snapshots.ReplaceOrInsert(&btreeStore{tree: newestRemoved.tree, resourceVersion: rv})
 	}
 }
 
