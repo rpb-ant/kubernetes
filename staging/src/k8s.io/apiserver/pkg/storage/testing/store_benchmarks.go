@@ -52,9 +52,10 @@ var exemplarPodYAML []byte
 type scope string
 
 var (
-	cluster   scope = "Cluster"
-	node      scope = "Node"
-	namespace scope = "Namespace"
+	cluster         scope = "Cluster"
+	node            scope = "Node"
+	namespace       scope = "Namespace"
+	nodeInNamespace scope = "NodeInNamespace"
 )
 
 const (
@@ -459,7 +460,7 @@ func startBackgroundWatchListers(ctx context.Context, store storage.Interface, d
 func RunBenchmarkStoreList(ctx context.Context, b *testing.B, store storage.Interface, data BenchmarkData, useIndex bool) {
 	for _, rvm := range []metav1.ResourceVersionMatch{"", metav1.ResourceVersionMatchExact, metav1.ResourceVersionMatchNotOlderThan} {
 		b.Run(fmt.Sprintf("RV=%s", rvm), func(b *testing.B) {
-			for _, scope := range []scope{cluster, node, namespace} {
+			for _, scope := range []scope{cluster, node, namespace, nodeInNamespace} {
 				b.Run(fmt.Sprintf("Scope=%s", scope), func(b *testing.B) {
 					var expectedElements int
 					switch scope {
@@ -469,6 +470,8 @@ func RunBenchmarkStoreList(ctx context.Context, b *testing.B, store storage.Inte
 						expectedElements = len(data.Pods) / len(data.NodeNames)
 					case cluster:
 						expectedElements = len(data.Pods)
+					case nodeInNamespace:
+						expectedElements = len(data.Pods) / len(data.NamespaceNames) / len(data.NodeNames)
 					}
 					limitOptions := []int64{0}
 					switch {
@@ -535,6 +538,14 @@ func runBenchmarkStoreList(ctx context.Context, b *testing.B, store storage.Inte
 				objectCount.Add(uint64(objects))
 				listCount.Add(uint64(lists))
 			case namespace:
+				objects, lists := paginateList(ctx, store, "/pods/"+namespaceName, opts)
+				objectCount.Add(uint64(objects))
+				listCount.Add(uint64(lists))
+			case nodeInNamespace:
+				opts.Predicate.Field = fields.SelectorFromSet(fields.Set{"spec.nodeName": nodeName})
+				if useIndex {
+					opts.Predicate.IndexFields = []string{"spec.nodeName"}
+				}
 				objects, lists := paginateList(ctx, store, "/pods/"+namespaceName, opts)
 				objectCount.Add(uint64(objects))
 				listCount.Add(uint64(lists))

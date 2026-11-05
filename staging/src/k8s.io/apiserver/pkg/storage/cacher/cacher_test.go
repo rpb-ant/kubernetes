@@ -1029,6 +1029,12 @@ func BenchmarkStoreList(b *testing.B) {
 			podPerNamespaceCount: 1_100,
 			nodeCount:            1000,
 		},
+		{
+			// Index is not always selective, for example spec.nodeName="" matches all unscheduled pods.
+			namespaceCount:       10_000,
+			podPerNamespaceCount: 15,
+			nodeCount:            2,
+		},
 	}
 	for _, dims := range dimensions {
 		b.Run(fmt.Sprintf("Namespaces=%d/Pods=%d/Nodes=%d", dims.namespaceCount, dims.namespaceCount*dims.podPerNamespaceCount, dims.nodeCount), func(b *testing.B) {
