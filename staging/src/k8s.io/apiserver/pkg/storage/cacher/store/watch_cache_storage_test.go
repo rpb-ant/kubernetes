@@ -430,6 +430,57 @@ func TestStoreSingleKey(t *testing.T) {
 	assertStoreEmpty(t, store, "foo", 8)
 }
 
+func TestIndexSnapshotIsImmutable(t *testing.T) {
+	s := NewWatchCacheStorage(testStoreIndexers())
+	indexSnapshot := func() Snapshot {
+		snapshot, err := s.GetByIndexSnapshot("by_val", "bar")
+		require.NoError(t, err)
+		return snapshot
+	}
+	keys := func(snapshot Snapshot) (keys []string) {
+		for elem, err := range snapshot.RangePrefix("/pods/", "").All() {
+			require.NoError(t, err)
+			keys = append(keys, elem.Key)
+		}
+		return keys
+	}
+	update := func(eventType watch.EventType, key, value string, rv int) {
+		_, err := s.UpdateStore(eventType, testStorageElement(key, value, rv), uint64(rv))
+		require.NoError(t, err)
+	}
+
+	empty := indexSnapshot()
+	update(watch.Added, "/pods/b", "bar", 1)
+	update(watch.Added, "/pods/a", "bar", 2)
+	added := indexSnapshot()
+	update(watch.Modified, "/pods/a", "baz", 3)
+	moved := indexSnapshot()
+	update(watch.Deleted, "/pods/b", "bar", 4)
+	deleted := indexSnapshot()
+	require.NoError(t, s.Replace([]*Element{testStorageElement("/pods/c", "bar", 5)}, 5))
+	replaced := indexSnapshot()
+	s.UpdateResourceVersion(6)
+
+	for _, tc := range []struct {
+		name     string
+		snapshot Snapshot
+		expectRV uint64
+		expect   []string
+	}{
+		{name: "empty", snapshot: empty, expectRV: 0},
+		{name: "added", snapshot: added, expectRV: 2, expect: []string{"/pods/a", "/pods/b"}},
+		{name: "moved to another value", snapshot: moved, expectRV: 3, expect: []string{"/pods/b"}},
+		{name: "deleted", snapshot: deleted, expectRV: 4},
+		{name: "replaced", snapshot: replaced, expectRV: 5, expect: []string{"/pods/c"}},
+		{name: "resource version updated", snapshot: indexSnapshot(), expectRV: 6, expect: []string{"/pods/c"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.expect, keys(tc.snapshot))
+			assert.Equal(t, tc.expectRV, tc.snapshot.ResourceVersion())
+		})
+	}
+}
+
 func TestStoreIndexerSingleKey(t *testing.T) {
 	store := NewWatchCacheStorage(testStoreIndexers())
 	snap, err := store.GetByIndexSnapshot("by_val", "bar")

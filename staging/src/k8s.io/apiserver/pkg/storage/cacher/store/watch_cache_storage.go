@@ -18,14 +18,11 @@ package store
 
 import (
 	"fmt"
-	"iter"
-	"sort"
 	"sync"
 	"sync/atomic"
 
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/apiserver/pkg/features"
-	"k8s.io/apiserver/pkg/storage/cacher/key"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/tools/cache"
 )
@@ -85,84 +82,6 @@ func (w *WatchCacheStorage) MarkConsistent(consistent bool) {
 
 func (w *WatchCacheStorage) LatestSnapshot() Snapshot {
 	return w.latestSnapshot.Load()
-}
-
-// listSnapshot serves an unordered index bucket.
-type listSnapshot struct {
-	Items           []interface{}
-	resourceVersion uint64
-}
-
-var _ Snapshot = (*listSnapshot)(nil)
-
-func (l listSnapshot) ResourceVersion() uint64 {
-	return l.resourceVersion
-}
-
-func (l listSnapshot) GetByKey(key string) (interface{}, bool, error) {
-	for _, item := range l.Items {
-		elem, ok := item.(*Element)
-		if ok && elem.Key == key {
-			return item, true, nil
-		}
-	}
-	return nil, false, nil
-}
-
-func (l listSnapshot) OrderedListPrefix(prefix string, continueKey string) ([]interface{}, error) {
-	var result []interface{}
-	for _, item := range l.Items {
-		elem, ok := item.(*Element)
-		if !ok {
-			return nil, fmt.Errorf("non *Element returned from storage: %v", item)
-		}
-		if len(continueKey) > 0 && continueKey > elem.Key {
-			continue
-		}
-		if !key.HasPathPrefix(elem.Key, prefix) {
-			continue
-		}
-		result = append(result, item)
-	}
-	sort.Sort(sortableStoreElements(result))
-	return result, nil
-}
-
-func (l listSnapshot) RangePrefix(prefix, continueKey string) Range {
-	items, err := l.OrderedListPrefix(prefix, continueKey)
-	if err != nil {
-		return failedRange{err}
-	}
-	elems := make(elements, 0, len(items))
-	for _, item := range items {
-		// OrderedListPrefix has already checked every item is an *Element.
-		elems = append(elems, item.(*Element))
-	}
-	return elems
-}
-
-type failedRange struct{ err error }
-
-func (r failedRange) All() iter.Seq2[*Element, error] {
-	return func(yield func(*Element, error) bool) { yield(nil, r.err) }
-}
-
-func (r failedRange) Count() int {
-	return 0
-}
-
-type sortableStoreElements []interface{}
-
-func (s sortableStoreElements) Len() int {
-	return len(s)
-}
-
-func (s sortableStoreElements) Less(i, j int) bool {
-	return s[i].(*Element).Key < s[j].(*Element).Key
-}
-
-func (s sortableStoreElements) Swap(i, j int) {
-	s[i], s[j] = s[j], s[i]
 }
 
 // UpdateStore executes a mutation (Add, Update, Delete) on the underlying store.
@@ -233,11 +152,12 @@ func (w *WatchCacheStorage) GetExactSnapshotLocked(resourceVersion uint64) (Snap
 
 // GetByIndexSnapshot retrieves elements by index and wraps them in a Snapshot.
 func (w *WatchCacheStorage) GetByIndexSnapshot(indexName, value string) (Snapshot, error) {
-	w.lock.RLock()
-	defer w.lock.RUnlock()
-	result, resourceVersion, err := w.indexer.ByIndex(indexName, value)
+	// Cloning requires exclusive access, but takes O(1).
+	w.lock.Lock()
+	defer w.lock.Unlock()
+	snap, err := w.indexer.CloneByIndex(indexName, value)
 	if err != nil {
 		return nil, err
 	}
-	return listSnapshot{Items: result, resourceVersion: resourceVersion}, nil
+	return snap, nil
 }

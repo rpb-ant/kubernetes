@@ -32,33 +32,33 @@ import (
 // Difference in mutability of stored values is used for optimizing some operations in client-go Indexer.
 func newIndexer(indexers cache.Indexers) indexer {
 	return indexer{
-		indices:  map[string]map[string]map[string]*Element{},
+		indices:  map[string]map[string]*btreeStore{},
 		indexers: indexers,
 	}
 }
 
 type indexer struct {
-	indices         map[string]map[string]map[string]*Element
+	indices         map[string]map[string]*btreeStore
 	indexers        cache.Indexers
 	resourceVersion uint64
 }
 
-func (i *indexer) ByIndex(indexName, indexValue string) (list []interface{}, resourceVersion uint64, err error) {
-	indexFunc := i.indexers[indexName]
-	if indexFunc == nil {
-		return nil, 0, fmt.Errorf("index with name %s does not exist", indexName)
+// CloneByIndex should not be called concurrently, same as btreeStore.Clone.
+func (i *indexer) CloneByIndex(indexName, indexValue string) (*btreeStore, error) {
+	if i.indexers[indexName] == nil {
+		return nil, fmt.Errorf("index with name %s does not exist", indexName)
 	}
-	index := i.indices[indexName]
-	set := index[indexValue]
-	list = make([]interface{}, 0, len(set))
-	for _, obj := range set {
-		list = append(list, obj)
+	bucket := i.indices[indexName][indexValue]
+	if bucket == nil {
+		empty := newBtreeStore(btreeDegree)
+		bucket = &empty
 	}
-	return list, i.resourceVersion, nil
+	bucket.resourceVersion = i.resourceVersion
+	return bucket.Clone(), nil
 }
 
 func (i *indexer) Replace(objs []*Element, resourceVersion uint64) error {
-	i.indices = map[string]map[string]map[string]*Element{}
+	i.indices = map[string]map[string]*btreeStore{}
 	i.resourceVersion = resourceVersion
 	for _, storeElem := range objs {
 		err := i.updateElem(storeElem.Key, nil, storeElem, resourceVersion)
@@ -91,43 +91,44 @@ func (i *indexer) updateElem(key string, oldObj, newObj *Element, resourceVersio
 		}
 		index := i.indices[name]
 		if index == nil {
-			index = map[string]map[string]*Element{}
+			index = map[string]*btreeStore{}
 			i.indices[name] = index
 		}
 		if len(indexValues) == 1 && len(oldIndexValues) == 1 && indexValues[0] == oldIndexValues[0] {
 			// We optimize for the most common case where indexFunc returns a single value which has not been changed
-			i.add(key, indexValues[0], newObj, index)
+			i.add(indexValues[0], newObj, index)
 			continue
 		}
 		for _, value := range oldIndexValues {
-			i.delete(key, value, index)
+			i.delete(value, oldObj, index)
 		}
 		for _, value := range indexValues {
-			i.add(key, value, newObj, index)
+			i.add(value, newObj, index)
 		}
 	}
 	return nil
 }
 
-func (i *indexer) add(key, value string, obj *Element, index map[string]map[string]*Element) {
-	set := index[value]
-	if set == nil {
-		set = map[string]*Element{}
-		index[value] = set
+func (i *indexer) add(value string, obj *Element, index map[string]*btreeStore) {
+	bucket := index[value]
+	if bucket == nil {
+		store := newBtreeStore(btreeDegree)
+		bucket = &store
+		index[value] = bucket
 	}
-	set[key] = obj
+	bucket.addOrUpdateElem(obj, i.resourceVersion)
 }
 
-func (i *indexer) delete(key, value string, index map[string]map[string]*Element) {
-	set := index[value]
-	if set == nil {
+func (i *indexer) delete(value string, obj *Element, index map[string]*btreeStore) {
+	bucket := index[value]
+	if bucket == nil {
 		return
 	}
-	delete(set, key)
-	// If we don's delete the set when zero, indices with high cardinality
+	bucket.deleteElem(obj, i.resourceVersion)
+	// If we don's delete the bucket when zero, indices with high cardinality
 	// short lived resources can cause memory to increase over time from
-	// unused empty sets. See `kubernetes/kubernetes/issues/84959`.
-	if len(set) == 0 {
+	// unused empty buckets. See `kubernetes/kubernetes/issues/84959`.
+	if bucket.tree.Len() == 0 {
 		delete(index, value)
 	}
 }
